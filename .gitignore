@@ -27,3 +27,9 @@ Thumbs.db
 # 注意：data/ledger/signals.csv 要保留并提交
 # 它是回测的样本来源，丢了就等于把历史判断全丢了
 !data/ledger/signals.csv
+
+# 注意：data/memory/*.jsonl 同样要保留并提交
+# 那是积累下来的判断与教训 —— 这套系统的价值有一半在这里。
+# 丢了不是"少了个缓存"，是从头开始学。
+# 只是：跑测试/CI 前记得设 DSA_MEMORY_DIR 指向临时目录，
+# 别把测试造出来的假判断混进真记忆里。

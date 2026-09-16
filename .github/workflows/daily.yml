@@ -61,14 +61,23 @@ jobs:
           fi
           python main.py analyze $MOCK $SYMS --out data/latest_dashboard.md
 
-      # 把当日看板和信号台账提交回去 —— 台账是回测的样本来源，必须持久化
+      # 结算旧判断 → 写教训。放在 analyze 之后、提交之前：
+      # 分析只负责写下新判断，结算必须等验证期走完，两者是不同的时间动作。
+      # 这一步失败不该影响当天的看板，所以容错。
+      - name: 反思结算（把走完验证期的判断变成教训）
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: python main.py reflect || echo "结算未完成（数据源问题或验证期未满），忽略"
+
+      # 把当日看板、信号台账、反思记忆提交回去 —— 三者都是资产：
+      # 台账是回测的样本来源，记忆是积累下来的全部教训，丢了都是从零开始
       # 注意：这里只提交 data/ ，绝不提交 .env 或任何含 token 的文件
-      - name: 持久化台账与看板
+      - name: 持久化台账、记忆与看板
         run: |
           git config user.name "dsa-lite-bot"
           git config user.email "bot@users.noreply.github.com"
           git add data/ || true
-          git diff --staged --quiet || git commit -m "chore: 每日信号台账 $(date +%F)"
+          git diff --staged --quiet || git commit -m "chore: 每日信号台账与反思记忆 $(date +%F)"
           git push || echo "无变更或推送失败，忽略"
 
       - name: 上传产物

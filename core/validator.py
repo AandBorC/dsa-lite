@@ -80,6 +80,7 @@ class ValidationReport:
     advice: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     benchmark_note: str = ""
+    strategy_stats: dict = field(default_factory=dict)   # 策略自报的运行统计（含记忆注入）
 
 
 # ============================================================
@@ -106,6 +107,11 @@ class StrategyValidator:
         engine = BacktestEngine(strategy, self.cfg)
         result = engine.run(bars_by_symbol, benchmark, as_of=as_of)
         report = self._build_report(result, bars_by_symbol, benchmark, name)
+        # 策略自报统计（LLM 策略会报记忆注入情况）。带上它，报告才能回答
+        # 「这次跑到底有没有真的注入记忆」—— 否则加没加记忆，报告长得一模一样。
+        stats = getattr(strategy, "stats", None)
+        if isinstance(stats, dict):
+            report.strategy_stats = dict(stats)
         return result, report
 
     # ---------- 报告构建 ----------
@@ -287,6 +293,20 @@ def render_validation(rep: ValidationReport, result: BacktestResult) -> str:
     # 这份数字是在哪个数据边界上算出来的 —— 尤其复权基准会随时间漂移。
     A(f"- 时点门控：`as_of={result.as_of}`" if result.as_of
       else "- 时点门控：**未指定 as_of**（不额外截断，时点正确性依赖数据区间）")
+    # 记忆注入情况。写成一行而不是省略，理由和上面一样：加了记忆却没生效
+    # （没数据、没到验证期、字段写错），报告上必须看得出来。
+    ss = rep.strategy_stats or {}
+    if "memory_injected" in ss:
+        if ss["memory_injected"]:
+            A(f"- 反思记忆：注入 {ss['memory_injected']} 次，"
+              f"累计可见教训 {ss.get('lessons_shown', 0)} 条、"
+              f"按门控扣留 {ss.get('blocked', 0)} 条、"
+              f"验证期内 {ss.get('pending', 0)} 条")
+            if not ss.get("lessons_shown"):
+                A("  > ⚠️ 注入次数不为零但**一条教训都没出现** —— "
+                  "记忆库为空或全部判断仍在验证期。这不是「记忆无效」，是还没积累到。")
+        else:
+            A("- 反思记忆：**未注入**（本次运行未开启或策略未接收）")
     A("")
     if "样本不足" in rep.grade:
         A("> ⚠️ **交易样本不足，下表仅供参考，不构成对策略有效性的判断。**")

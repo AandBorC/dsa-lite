@@ -39,10 +39,11 @@ log = logging.getLogger("llm")
 # 提示词模板（prompt_version 变了就必须重新回测）
 # ------------------------------------------------------------
 
-# v2 起加入「时点纪律」段。改提示词必须同步升版本号 ——
+# v2 起加入「时点纪律」段。v3 起加入「历史判断回顾」（反思记忆）槽位。
+# 改提示词必须同步升版本号 ——
 # 缓存按 prompt 内容哈希，但版本号是台账里唯一的可追溯线索：
 # 不升版，三个月后没人说得清那次回测用的是哪一版 prompt。
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 SYSTEM_PROMPT = """你是一名严格的A股短线交易分析师。你只能基于用户提供的量化指标做判断，禁止引用任何外部信息。
 
@@ -51,6 +52,13 @@ SYSTEM_PROMPT = """你是一名严格的A股短线交易分析师。你只能基
 - 禁止引用你在训练数据里关于这段时期的记忆（"后来它涨了""这家公司后来出事了"）
 - 禁止假设后续的行情、政策、业绩、公告
 - 如果某个结论只能靠"事后已知的结果"才能得出，那就不要给出这个结论 —— 宁可 HOLD
+
+历史判断回顾的使用规则（如果提供了这一段）：
+那里面是**你自己**过去的判断和已结算结果，用途只有一个：别重复同一个错误。
+- 它是参考，不是命令。如果你认为本次情况确实不同，可以推翻它，但必须在 reason 里写明理由
+- 只被"已结算"的结果影响。正在验证期内的判断不是失误，不要为了纠正它而反向操作
+- 历史模式不构成对本次走势的预知。它说明过去，不说明这一次
+- 如果本次事实与历史教训冲突，以本次事实为准
 
 硬性规则：
 1. 只输出一个 JSON 对象，不要 markdown 代码块，不要任何解释文字。
@@ -69,20 +77,29 @@ USER_TEMPLATE = """标的：{symbol}
 {facts}
 
 当前状态：{position_desc}
-
+{memory}
 现在是 {date} 收盘之后，{date} 之后发生的事你一无所知。
 请判断下一个交易日之后的操作方向。记住：只输出 JSON。"""
 
 
 def build_prompt(symbol: str, snap, holding: bool = False,
-                 pnl_pct: Optional[float] = None) -> str:
-    """构造完整 prompt（system + user 拼接后用于缓存哈希）。"""
+                 pnl_pct: Optional[float] = None,
+                 memory_block: str = "") -> str:
+    """
+    构造完整 prompt（system + user 拼接后用于缓存哈希）。
+
+    memory_block 是「历史判断回顾」。它天然被缓存哈希覆盖 ——
+    记忆一变，哈希就变，缓存自动失效。这一点很重要：
+    否则加了记忆却命中旧缓存，等于加了没生效，而且完全看不出来。
+    """
     pos_desc = "空仓"
     if holding:
         pos_desc = f"已持仓，当前浮动盈亏 {pnl_pct:+.2f}%" if pnl_pct is not None else "已持仓"
+    mem = f"\n{memory_block.strip()}\n" if memory_block and memory_block.strip() else ""
     return (SYSTEM_PROMPT + "\n---\n" +
             USER_TEMPLATE.format(symbol=symbol, date=snap.date,
-                                 facts=snap.render_text(), position_desc=pos_desc))
+                                 facts=snap.render_text(), position_desc=pos_desc,
+                                 memory=mem))
 
 
 # ------------------------------------------------------------
@@ -215,10 +232,12 @@ class LLMAnalyzer:
         # 本地端点不需要 API Key（Ollama 的 OpenAI 兼容层不校验它）
         return bool(self.api_key) or _is_local_url(self.base_url)
 
-    def analyze(self, snap, position=None, holding: bool = False) -> Signal:
+    def analyze(self, snap, position=None, holding: bool = False,
+                memory_block: str = "") -> Signal:
         prompt = build_prompt(
             snap.symbol, snap, holding=holding,
-            pnl_pct=(position or {}).get("pnl_pct") if position else None)
+            pnl_pct=(position or {}).get("pnl_pct") if position else None,
+            memory_block=memory_block)
 
         # 1) 缓存
         if self.use_cache:
@@ -336,7 +355,11 @@ class MockAnalyzer:
     def available(self) -> bool:
         return True
 
-    def analyze(self, snap, position=None, holding: bool = False) -> Signal:
+    def analyze(self, snap, position=None, holding: bool = False,
+                memory_block: str = "") -> Signal:
+        # memory_block 刻意不参与规则计算：MockAnalyzer 是「不用 LLM 能拿到什么」
+        # 的对照线。让它也读记忆，这条对照线就被污染了 —— 那样再拿 LLM 跟它比，
+        # 比的就不是"模型增量"，而是"记忆增量"。
         self.stats["calls"] += 1
         f = snap.to_prompt_dict()
         score = 50.0

@@ -25,6 +25,10 @@ jobs:
     name: 零依赖（不装任何第三方包）
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # 记忆库必须导到临时目录：测试里分析的每一步都会写判断记录，
+      # 落在仓库里就成了"假记忆"，而假记忆会被真的注入后续分析。
+      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +54,9 @@ jobs:
       - name: 时点门控验收
         run: python tests/test_lookahead.py
 
+      - name: 反思记忆验收（重点：证明它不漏未来）
+        run: python tests/test_memory.py
+
       - name: 语法与导入检查
         run: python -m compileall -q main.py core tests
 
@@ -58,6 +65,18 @@ jobs:
           python main.py --help
           python main.py doctor --help
           python main.py asof --help
+          python main.py reflect --help
+          python main.py memory --help
+
+      - name: 确认测试没有污染仓库
+        run: |
+          if [ -e data/memory ]; then
+            echo "::error::测试往仓库里写了记忆文件："; ls -la data/memory
+            exit 1
+          fi
+          git diff --exit-code -- data/ledger/signals.csv \
+            || { echo "::error::测试改动了已提交的信号台账"; exit 1; }
+          echo "工作区干净，无测试残留 ✅"
 
   # ------------------------------------------------------------
   # 2) 多版本矩阵：3.10 是 requires-python 的下限，3.13 是当前
@@ -66,6 +85,8 @@ jobs:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
     strategy:
       fail-fast: false
       matrix:
@@ -91,9 +112,12 @@ jobs:
       - name: 时点门控验收
         run: python tests/test_lookahead.py
 
+      - name: 反思记忆验收
+        run: python tests/test_memory.py
+
       - name: 导入检查（有 pyyaml 时 config.yaml 走真实解析路径）
         run: |
-          python -c "import core.asof, core.backtest, core.fetchers, core.llm, core.validator, core.strategies, core.indicators; print('imports ok')"
+          python -c "import core.asof, core.backtest, core.fetchers, core.llm, core.memory, core.validator, core.strategies, core.indicators; print('imports ok')"
           python - <<'PY'
           import main
           cfg = main.load_config("config.yaml")
@@ -112,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
+    env:
+      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +150,15 @@ jobs:
 
       - name: 离线分析链路（不调 LLM）
         run: python main.py analyze --mock --no-notify --symbols sh600519,sz000858 --days-back 300
+
+      - name: 反射链路冒烟（判断 → 记忆 → 结算）
+        run: |
+          echo "--- 刚写下的判断应处于验证期 ---"
+          python main.py memory --symbol sh600519
+          echo "--- 结算（新判断尚未到期，应报「验证期未走完」而不是报错） ---"
+          python main.py reflect
+          echo "--- reflect 必须可重复执行且不重复结算 ---"
+          python main.py reflect
 
   # ------------------------------------------------------------
   # 4) 静态检查（不阻塞：风格问题不该拦住功能合并）

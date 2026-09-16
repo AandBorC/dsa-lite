@@ -284,30 +284,58 @@ class LLMStrategy(Strategy):
     """
     用 LLM 做决策的策略适配器。
 
-    三个工程要点（也是 LLM 回测最容易翻车的地方）：
+    四个工程要点（也是 LLM 回测最容易翻车的地方）：
       1. 只把 Snapshot 交给模型，不喂原始K线 —— 控制 token，也逼模型看指标
       2. 输出强约束为 JSON —— 解析失败即降级为 HOLD，绝不猜
       3. 按 prompt 哈希缓存 —— 否则每次回测都在烧钱，也永远无法复现
+      4. 记忆按当根K线的日期门控 —— 回测到 2025-06-20 那一根时，
+         只看得见 2025-06-20 时点已知的教训
+
+    第 4 点是这里最容易做错的地方：记忆是跨时间的，如果按"今天"取，
+    整段回测就会拿到全部 hindsight，等于开卷考试，而且**表面上完全看不出来**。
+
+    回测**只读**记忆，绝不写。写了就会污染记忆库，之后再拿这个库做回测
+    就变成自我循环 —— 模型的判断被自己的判断强化，看起来越来越准。
     """
 
     name = "llm"
     source = "llm"
 
     def __init__(self, analyzer, cache=None, prompt_version: str = "v1",
-                 min_score_to_buy: float = 65.0, max_score_to_sell: float = 35.0):
+                 min_score_to_buy: float = 65.0, max_score_to_sell: float = 35.0,
+                 memory=None):
         self.analyzer = analyzer
         self.cache = cache
         self.prompt_version = prompt_version
         self.buy_th, self.sell_th = min_score_to_buy, max_score_to_sell
+        self.memory = memory
+        # 记忆使用台账：没有它就无法回答"这次回测到底有没有真的注入记忆"
+        # —— 一个静默失效的记忆注入，和没注入的区别，只有在对比里才看得出来。
+        self.stats = {"memory_injected": 0, "lessons_shown": 0,
+                      "blocked": 0, "pending": 0, "empty": 0}
 
     def warmup(self) -> int:
         return 70
 
     def decide(self, symbol: str, bars: list, i: int, position=None) -> Signal:
         snap = build_snapshot(symbol, bars, i)
-        ctx = {"position": position, "holding": bool(position)}
+
+        # ---- 记忆按本根K线日期门控 ----
+        block, lesson_ids = "", []
+        if self.memory is not None:
+            ctx = self.memory.get_past_context(symbol, snap.date)
+            block = ctx.render()
+            lesson_ids = ctx.visible_lesson_ids()
+            self.stats["memory_injected"] += 1
+            self.stats["lessons_shown"] += len(ctx.lessons)
+            self.stats["blocked"] += ctx.blocked
+            self.stats["pending"] += ctx.pending
+            self.stats["empty"] += 1 if not ctx.lessons else 0
+
+        actx = {"position": position, "holding": bool(position),
+                "memory_block": block}
         try:
-            sig = self.analyzer.analyze(snap, **ctx)
+            sig = self.analyzer.analyze(snap, **actx)
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] %s LLM 分析失败，降级为 HOLD: %s", symbol, snap.date, exc)
             return Signal.hold(snap.date, symbol, source=self.source,
@@ -316,6 +344,8 @@ class LLMStrategy(Strategy):
                                reason=f"LLM调用失败: {type(exc).__name__}")
         sig.prompt_version = self.prompt_version
         sig.meta.setdefault("snapshot", snap.to_prompt_dict())
+        if self.memory is not None:
+            sig.meta["memory_lessons"] = lesson_ids
 
         # 分数闸门：模型说买但分数不够 → 降为观望。防止模型"嘴上一套分数一套"。
         if sig.action == Action.BUY and sig.score < self.buy_th:

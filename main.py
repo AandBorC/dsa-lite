@@ -6,10 +6,12 @@ dsa-lite —— 带策略验证的 LLM 股票分析系统
 工程结构参考 daily_stock_analysis（多源降级 + 定时任务 + 多通道推送），
 核心增量是它没有的东西：**可证伪的回测与策略验证层**。
 
-六个命令说白了就是一条完整闭环：
+八个命令说白了就是一条完整闭环：
 
     doctor    先体检：环境、数据源、LLM 到底通不通
-    analyze   每天跑一次，产出决策看板并推送（同时把信号写进台账）
+    analyze   每天跑一次，产出决策看板并推送（同时把判断写进台账与记忆库）
+    reflect   反思结算：把走完验证期的旧判断变成教训（写入记忆库）
+    memory    查看记忆库；给 --symbol 就能看到模型在某天到底看得见哪些教训
     backtest  用历史数据验证策略，回答"这套逻辑到底赚不赚钱"
     validate  进阶验证：五大指标打分 + 样本内外一致性 + 显著性检验
     compare   多策略横向对比，看 LLM 相对朴素规则到底有没有增量
@@ -19,6 +21,9 @@ dsa-lite —— 带策略验证的 LLM 股票分析系统
     python main.py doctor                       # 先跑这个，30 秒定位问题
     python main.py analyze                      # 每日分析（有 LLM_API_KEY 就用真模型）
     python main.py analyze --mock               # 离线模式，纯规则模拟
+    python main.py analyze --no-memory          # 对照组：关掉记忆跑同一次分析
+    python main.py reflect                      # 结算 → 写教训
+    python main.py memory --symbol sz300750     # 看这天模型看得见什么
     python main.py backtest --strategy five_dim --symbols sh600519,sz000858
     python main.py validate --strategy five_dim --split 0.7
     python main.py compare --symbols sh600519,sz000858,sh601318
@@ -41,13 +46,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from core import asof                                              # noqa: E402
+from core import asof, memory                                     # noqa: E402
 from core.backtest import BacktestConfig, BacktestEngine          # noqa: E402
 from core.fetchers import (CACHE_DIR, Bar, CsvCache, FetcherChain,  # noqa: E402
                            NoDataSourceError, _apply_adjust, _importable,
                            get_benchmark, to_ts_code)
 from core.llm import (MockAnalyzer, PROMPT_VERSION, _is_local_url,  # noqa: E402
                       build_analyzer)
+from core.memory import MemoryStore, render_memory_audit           # noqa: E402
 from core.notify import Notifier                                   # noqa: E402
 from core.report import (render_backtest_summary, render_dashboard,  # noqa: E402
                          render_trades)
@@ -190,12 +196,14 @@ def make_backtest_cfg(cfg: dict) -> BacktestConfig:
     return BacktestConfig(**{k: v for k, v in bt.items() if k in allowed})
 
 
-def make_strategy(kind: str, cfg: dict, analyzer=None, ledger_signals=None):
-    """构造策略。ledger 类型需要外部提供信号列表。"""
+def make_strategy(kind: str, cfg: dict, analyzer=None, ledger_signals=None,
+                  memory_store=None):
+    """构造策略。llm 类型需要 analyzer；ledger 类型需要外部提供信号列表。"""
     if kind == "llm":
         if analyzer is None:
             raise RuntimeError("llm 策略需要 analyzer")
-        return LLMStrategy(analyzer, cache=SignalCache(), prompt_version=PROMPT_VERSION)
+        return LLMStrategy(analyzer, cache=SignalCache(), prompt_version=PROMPT_VERSION,
+                           memory=memory_store)
     if kind == "ledger":
         if not ledger_signals:
             raise RuntimeError("台账为空，先跑 analyze 积累信号")
@@ -211,12 +219,13 @@ def cmd_analyze(args, cfg: dict) -> int:
     symbols = args.symbols.split(",") if args.symbols else cfg["watchlist"]
     symbols = [s.strip() for s in symbols if s.strip()]
     start, end = date_range(cfg, days_back=args.days_back)
+    as_of = _as_of(args)
 
     chain = make_chain(cfg)
     log.info("抓取 %d 只标的的行情（%s ~ %s）", len(symbols), start, end)
     bars_by_symbol, sources = chain.fetch_many(
         symbols, start, end, adjust=cfg["adjust"],
-        force_refresh=args.refresh)
+        force_refresh=args.refresh, as_of=as_of)
 
     errors = [f"{s}" for s in symbols if s not in bars_by_symbol]
     if not bars_by_symbol:
@@ -227,19 +236,41 @@ def cmd_analyze(args, cfg: dict) -> int:
     ledger = SignalLedger()
     signals = []
 
+    # 反思记忆：默认开。--no-memory 是同一条策略的对照组 ——
+    # 「记忆到底有没有用」不该靠感觉，该拿两次回测比出来。
+    store = None if args.no_memory else MemoryStore()
+    snaps: dict = {}
+    mem_lines: list[str] = []
+
     # 持仓上下文：从台账里最近一次 BUY 推断（简单版）
     for sym, bars in bars_by_symbol.items():
         if len(bars) < 65:
             log.warning("[%s] 仅 %d 根K线，不足 65 根，跳过", sym, len(bars))
             continue
         i = len(bars) - 1
+        snap = _snap(sym, bars, i)          # 只算一次，别在循环里重复构造
+        snaps[sym] = snap
+
+        # 记忆的时点 = 决策所依据的最后一根K线日期，不是"今天"。
+        # 用今天取记忆，回放到历史日期时会拿到全部 hindsight。
+        ctx = None
+        block = ""
+        if store is not None:
+            ctx = store.get_past_context(sym, snap.date)
+            block = ctx.render()
+            mem_lines.extend(render_memory_audit(ctx))
+
         try:
-            sig = analyzer.analyze(_snap(sym, bars, i), holding=False)
+            sig = analyzer.analyze(snap, holding=False, memory_block=block)
         except Exception as exc:  # noqa: BLE001
             log.error("[%s] 分析失败: %s", sym, exc)
             errors.append(f"{sym}(分析异常)")
             continue
-        sig.meta.setdefault("snapshot", _snap(sym, bars, i).to_prompt_dict())
+        sig.meta.setdefault("snapshot", snap.to_prompt_dict())
+        if ctx is not None:
+            # 记下"这次能看见哪些教训" —— 事后复盘时，这是区分
+            # 「模型没学会」和「模型根本没收到」的唯一线索
+            sig.meta["memory_lessons"] = ctx.visible_lesson_ids()
         signals.append(sig)
 
     if not signals:
@@ -248,9 +279,28 @@ def cmd_analyze(args, cfg: dict) -> int:
 
     added = ledger.append(signals)
 
+    # ---- 把这次的判断落进记忆库（analyze 是唯一的写入入口）----
+    # 回测路径绝不写：写了就会污染记忆库，之后拿它做回测变成自我循环。
+    if store is not None:
+        n_new = 0
+        for sig in signals:
+            rec = store.record_decision(
+                sig, snap=snaps.get(sig.symbol),
+                facts=sig.meta.get("snapshot"),
+                visible_lessons=sig.meta.get("memory_lessons") or [])
+            n_new += 1 if rec else 0
+        log.info("记忆 | 本次新增判断 %d 条（重复 %d 条已跳过）",
+                 n_new, len(signals) - n_new)
+        for line in mem_lines:
+            log.info("%s", line)
+
     body = render_dashboard(
         signals, data_sources=sources, errors=errors,
         title_date=bars_by_symbol[list(bars_by_symbol)[0]][-1].date)
+    if mem_lines:
+        # 让记忆的介入在每日输出里可见 —— 一个静默的记忆注入和没注入，
+        # 在结果上分不出来，在过程上必须分得出来。
+        body += ("\n\n## 记忆注入\n\n" + "\n".join(f"- {x}" for x in mem_lines))
 
     # 控制台既可能由 print 输出，也可能由 Notifier 的 console 通道输出 ——
     # 两者同时开会把看板打两遍，所以这里二选一。
@@ -311,6 +361,14 @@ def _as_of(args) -> str | None:
         raise SystemExit(f"--as-of 格式无法识别：{raw}（应形如 2025-06-20）") from exc
 
 
+def _memory_store(args):
+    """记忆库工厂。--no-memory 时返回 None，即完全关闭记忆注入。"""
+    if getattr(args, "no_memory", False):
+        log.info("记忆已关闭（--no-memory）：本次运行为对照组")
+        return None
+    return MemoryStore()
+
+
 def cmd_backtest(args, cfg: dict) -> int:
     symbols = [s.strip() for s in (args.symbols or ",".join(cfg["watchlist"])).split(",") if s.strip()]
     bars, bench = _load_bars(cfg, symbols, args)
@@ -351,7 +409,8 @@ def cmd_validate(args, cfg: dict) -> int:
 
     if args.strategy == "llm":
         analyzer = build_analyzer("mock" if args.mock else cfg["analyzer"])
-        st = make_strategy("llm", cfg, analyzer=analyzer)
+        st = make_strategy("llm", cfg, analyzer=analyzer,
+                           memory_store=_memory_store(args))
     elif args.strategy == "ledger":
         st = make_strategy("ledger", cfg, ledger_signals=SignalLedger().read())
     else:
@@ -396,7 +455,8 @@ def cmd_compare(args, cfg: dict) -> int:
         if n == "llm":
             strategies.append(make_strategy("llm", cfg,
                                             analyzer=build_analyzer("mock" if args.mock else
-                                                                    cfg["analyzer"])))
+                                                                    cfg["analyzer"]),
+                                            memory_store=_memory_store(args)))
         else:
             try:
                 strategies.append(make_strategy(n, cfg))
@@ -736,6 +796,184 @@ def cmd_ledger(args, cfg: dict) -> int:
 
 
 # ============================================================
+# reflect —— 反思结算：把走完验证期的旧判断变成教训
+# ============================================================
+
+def cmd_reflect(args, cfg: dict) -> int:
+    """
+    为什么要有这个命令，而不是"结算"自动发生在 analyze 里？
+
+    因为结算需要**未来数据**，而 analyze 的时点是当下 ——
+    在 analyze 里顺手结算，等于让当天那次分析去读自己的未来。
+    分开之后，"什么时候可以结算"变成一件显式的事，也就可以被审计。
+    """
+    store = MemoryStore()
+    symbol = args.symbol or None
+    as_of = _as_of(args)
+    st0 = store.stats()
+    opens = store.open_decisions(symbol)
+
+    print("# 反思结算 · reflection")
+    print()
+    print(f"- 记忆库：`{_rel(store.root)}`")
+    print(f"- 判断总览：**{st0['decisions']}** 条"
+          f"（已结算 {st0['resolved']} / 待结算 {st0['open']}）")
+    print(f"- 结算时点：`{as_of}`" if as_of
+          else "- 结算时点：未限制（使用全部已有数据）")
+    print()
+
+    if not opens:
+        print("没有待结算的判断。")
+        print("先跑 `python main.py analyze` 把每日判断写进记忆库。")
+        return 0
+
+    # 取数窗口必须覆盖最早的决策日 + 它的验证期，否则那些老判断会一直
+    # 结算不了，而日志只会说"跳过" —— 那种沉默最容易被当成"没问题"。
+    earliest = min(d.trade_date for d in opens)
+    span = (datetime.now() - datetime.strptime(earliest, "%Y-%m-%d")).days + 30
+    days = max(args.days_back, span)
+    symbols = sorted({d.symbol for d in opens})
+    start, end = date_range(cfg, days_back=days)
+
+    chain = make_chain(cfg)
+    log.info("为 %d 条待结算判断取数（%s ~ %s，%d 只标的）",
+             len(opens), start, end, len(symbols))
+    bars, _ = chain.fetch_many(symbols, start, end, adjust=cfg["adjust"],
+                               force_refresh=args.refresh, as_of=as_of)
+
+    fresh = store.resolve(bars, as_of=as_of, symbol=symbol)
+
+    print(f"## 本次结算 {len(fresh)} 条")
+    print()
+    if fresh:
+        print("| 决策日 | 标的 | 方向 | 结果 | 区间收益 | 教训 |")
+        print("|--------|------|------|------|---------|------|")
+        cn = {"BUY": "买入", "SELL": "卖出", "HOLD": "观望", "AVOID": "回避"}
+        flag = {"hit": "✅ 成立", "miss": "❌ 未成立", "flat": "— 无信息", "void": "⚠️ 无效"}
+        for l in sorted(fresh, key=lambda x: x.decision_date):
+            print(f"| {l.decision_date} | {l.symbol} | {cn.get(l.action, l.action)} | "
+                  f"{flag.get(l.verdict, l.verdict)} | {l.ret_pct:+.1f}% | {l.lesson} |")
+    else:
+        print("本次没有可以结算的判断 —— 下面说明卡在哪里。")
+    print()
+
+    # ---- 为什么还剩着？必须说清楚，不能只报个数字 ----
+    left = store.open_decisions(symbol)
+    if left:
+        wait, short_window = [], []
+        for d in left:
+            b = bars.get(d.symbol)
+            if not b or not b or d.trade_date < b[0].date:
+                short_window.append(d)
+            else:
+                wait.append(d)
+        print(f"## 仍未结算 {len(left)} 条")
+        print()
+        if wait:
+            print(f"- **验证期未走完**：{len(wait)} 条。"
+                  f"这是正确的 —— 提前用半截数据结算，等于给判断硬安一个结论。")
+        if short_window:
+            print(f"- **取数窗口不够长**：{len(short_window)} 条"
+                  f"（最早 `{min(d.trade_date for d in short_window)}`）。"
+                  f"加大 `--days-back` 再跑。")
+            print("  > 这类跳过是静默失败的高发区：日志只说「跳过」，"
+                  "看起来像「没问题」。")
+        print()
+
+    # ---- 累计错误画像 ----
+    st = store.stats()
+    if st["by_error"]:
+        print("## 累计错误画像（全部已结算）")
+        print()
+        print("| 类型 | 次数 | 成立 | 按方向平均影响 | 说明 |")
+        print("|------|------|------|---------------|------|")
+        for err, v in sorted(st["by_error"].items(), key=lambda x: -x[1]["n"]):
+            print(f"| `{err}` | {v['n']} | {v['hit']} | {v['avg']:+.2f}% | "
+                  f"{memory.ERROR_LABEL.get(err, err)} |")
+        print()
+        weak = [(k, v) for k, v in st["by_error"].items()
+                if v["n"] >= memory.MIN_SAMPLE_FOR_PATTERN and v["hit"] / v["n"] < 0.5]
+        if weak:
+            print("### 值得注意的重复性错误")
+            print()
+            for k, v in sorted(weak, key=lambda x: x[1]["avg"]):
+                print(f"- `{k}`（{memory.ERROR_LABEL.get(k, k)}）：{v['n']} 次中仅 "
+                      f"{v['hit']} 次成立，平均影响 {v['avg']:+.2f}% —— "
+                      f"这是样本足够之上的系统性偏差，不是运气。")
+        else:
+            print(f"（没有达到「样本 ≥{memory.MIN_SAMPLE_FOR_PATTERN} 次且成立率 <50%」"
+                  f"的重复性错误 —— 样本不够或暂未发现模式。）")
+        print()
+    return 0
+
+
+# ============================================================
+# memory —— 看记忆库，以及"模型在这一天到底看得见什么"
+# ============================================================
+
+def cmd_memory(args, cfg: dict) -> int:
+    store = MemoryStore()
+
+    # 给了 --symbol 就打印**渲染好的上下文** —— 也就是模型真正会看到的那段文本。
+    # 这是验证时点门控最直接的办法：不猜，直接看。
+    if args.symbol:
+        a = asof.norm(args.as_of) if args.as_of else asof.today()
+        ctx = store.get_past_context(args.symbol, a)
+        print(f"# 记忆快照 · {args.symbol} @ {ctx.as_of}")
+        print()
+        print(ctx.render())
+        print()
+        print("## 注入审计")
+        print()
+        for line in render_memory_audit(ctx):
+            print(f"- {line}")
+        return 0
+
+    st = store.stats()
+    print("## 反思记忆")
+    print()
+    print(f"- 目录：`{_rel(store.root)}`")
+    print(f"- 判断：{st['decisions']} 条（已结算 {st['resolved']} / 待结算 {st['open']}）")
+    if st["decisions"]:
+        print(f"- 区间：{st['date_range'][0]} ~ {st['date_range'][1]}　"
+              f"覆盖标的：{st['symbols']} 只")
+    print()
+    if not st["decisions"]:
+        print("记忆库为空。跑 `python main.py analyze` 写下第一条判断；")
+        print("等验证期走完再跑 `python main.py reflect` 把它变成教训。")
+        return 0
+
+    if st["by_error"]:
+        print("### 错误画像")
+        print()
+        print("| 类型 | 次数 | 成立 | 平均影响 |")
+        print("|------|------|------|---------|")
+        for err, v in sorted(st["by_error"].items(), key=lambda x: -x[1]["n"]):
+            print(f"| `{err}` | {v['n']} | {v['hit']} | {v['avg']:+.2f}% |")
+        print()
+
+    if args.tail:
+        ls = store.lessons()[-args.tail:]
+        if ls:
+            print(f"### 最近 {len(ls)} 条教训")
+            print()
+            print("| 决策日 | 可知日 | 标的 | 方向 | 结果 | 收益 |")
+            print("|--------|--------|------|------|------|------|")
+            for l in ls:
+                print(f"| {l.decision_date} | {l.learned_date} | {l.symbol} | "
+                      f"{l.action} | {l.verdict} | {l.ret_pct:+.1f}% |")
+            print()
+            # 「可知日」这一列是这套设计最该被看见的地方：
+            # 它常常晚于决策日很久，却是这条教训真正的生效起点。
+            print("> `可知日` 是教训真正生效的日期（决策日 + 验证期），"
+                  "不是它被写下的日期。")
+            print("> 门控用的就是它 —— 所以今天写下的教训，"
+                  "也能安全地用于三个月前的回测。")
+    return 0
+
+
+
+# ============================================================
 # asof —— 时点审计：这次运行「本不该看到」哪些东西
 # ============================================================
 
@@ -873,6 +1111,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python main.py analyze --mock\n"
+               "  python main.py reflect                       # 把走完验证期的旧判断结算成教训\n"
+               "  python main.py memory --symbol sz300750      # 看模型在这天到底看得见什么\n"
                "  python main.py validate --strategy five_dim --split 0.7 --out reports/validate.md\n"
                "  python main.py compare --strategies ma_cross,five_dim,rsi_reversion\n"
                "  python main.py asof --as-of 2025-06-20        # 看这次运行本不该看到哪些数据\n")
@@ -887,6 +1127,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--out", default="", help="看板输出路径")
     a.add_argument("--days-back", type=int, default=400)
     a.add_argument("--refresh", action="store_true", help="忽略缓存重新抓取")
+    a.add_argument("--as-of", default="", metavar="YYYY-MM-DD",
+                   help="时点门控：按该日期回放分析（记忆也随之门控）")
+    a.add_argument("--no-memory", action="store_true",
+                   help="关闭反思记忆（作为对照组，用来验证记忆有没有用）")
 
     b = sub.add_parser("backtest", help="基础回测")
     _add_common(b)
@@ -911,6 +1155,18 @@ def build_parser() -> argparse.ArgumentParser:
     l = sub.add_parser("ledger", help="查看信号台账")
     l.add_argument("--tail", type=int, default=10)
 
+    r = sub.add_parser("reflect", help="反思结算：把走完验证期的判断变成教训")
+    r.add_argument("--symbol", default="", help="只结算该标的，默认全部")
+    r.add_argument("--as-of", default="", metavar="YYYY-MM-DD",
+                   help="只用该日期及之前的K线结算（让结算本身可复现）")
+    r.add_argument("--days-back", type=int, default=700)
+    r.add_argument("--refresh", action="store_true")
+
+    m = sub.add_parser("memory", help="查看反思记忆库 / 模型在某天看得见什么")
+    m.add_argument("--symbol", default="", help="给定时打印该标的在 --as-of 时点看到的记忆全文")
+    m.add_argument("--as-of", default="", metavar="YYYY-MM-DD", help="时点，默认今天")
+    m.add_argument("--tail", type=int, default=8, help="显示最近多少条教训")
+
     d = sub.add_parser("doctor", help="体检：环境 / 数据源 / LLM 通不通")
     d.add_argument("--symbol", default="", help="探测标的，默认 sh600519")
     d.add_argument("--skip-llm", action="store_true", help="跳过 LLM 连通性测试")
@@ -934,6 +1190,8 @@ def _add_common(sp) -> None:
     sp.add_argument("--refresh", action="store_true")
     sp.add_argument("--as-of", default="", metavar="YYYY-MM-DD",
                     help="时点门控：只使用该日期及之前可见的数据")
+    sp.add_argument("--no-memory", action="store_true",
+                    help="关闭反思记忆注入（LLM 策略的对照组）")
     sp.add_argument("--out", default="")
 
 
@@ -953,7 +1211,7 @@ def main() -> int:
         "doctor": cmd_doctor,
         "analyze": cmd_analyze, "backtest": cmd_backtest,
         "validate": cmd_validate, "compare": cmd_compare, "ledger": cmd_ledger,
-        "asof": cmd_asof,
+        "asof": cmd_asof, "reflect": cmd_reflect, "memory": cmd_memory,
     }.get(args.cmd)
     if handler is None:
         print(f"未知命令: {args.cmd}")
