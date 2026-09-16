@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的旧跑批自动取消，省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------
+  # 1) 核心承诺守卫：零强制依赖
+  #    项目对外宣称"纯标准库即可跑通主链路"，那就必须有一条
+  #    流水线真的什么都不装去验证它。否则这句承诺迟早悄悄失效。
+  #    全程离线，不依赖任何网络。
+  # ------------------------------------------------------------
+  stdlib-only:
+    name: 零依赖（不装任何第三方包）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确认环境确实干净
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          for mod in ("yaml", "tushare", "akshare", "baostock", "numpy", "pandas"):
+              assert u.find_spec(mod) is None, f"{mod} 不该存在，零依赖测试已失效"
+          print("环境干净：无任何第三方依赖 ✅")
+          PY
+
+      - name: 自检（验证「验证器」本身是否可信）
+        run: python tests/selftest.py
+
+      - name: 复权算法验收
+        run: python tests/test_adjust.py
+
+      - name: 语法与导入检查
+        run: python -m compileall -q main.py core tests
+
+      - name: CLI 冒烟（--help 必须不报错）
+        run: |
+          python main.py --help
+          python main.py doctor --help
+
+  # ------------------------------------------------------------
+  # 2) 多版本矩阵：3.10 是 requires-python 的下限，3.13 是当前
+  # ------------------------------------------------------------
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 装可选依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: 自检
+        run: python tests/selftest.py
+
+      - name: 复权算法验收
+        run: python tests/test_adjust.py
+
+      - name: 导入检查（有 pyyaml 时 config.yaml 走真实解析路径）
+        run: |
+          python -c "import core.backtest, core.fetchers, core.llm, core.validator, core.strategies, core.indicators; print('imports ok')"
+          python - <<'PY'
+          import main
+          cfg = main.load_config("config.yaml")
+          assert cfg["strategy"], "config.yaml 未正确加载"
+          assert cfg["fetcher_priority"], "fetcher_priority 缺失"
+          print("config.yaml 解析 ok →", cfg["strategy"], "|", " → ".join(cfg["fetcher_priority"]))
+          PY
+
+  # ------------------------------------------------------------
+  # 3) 网络冒烟：验证真实行情源还能用
+  #    独立成 job 且不阻塞 —— 上游接口挂掉是常态（东财有 IP 级限流），
+  #    不该因为别人家的服务抖动就把自己的 CI 判红。
+  # ------------------------------------------------------------
+  network-smoke:
+    name: 网络冒烟（真实数据源）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 数据源体检
+        run: python main.py doctor --skip-llm --skip-limited || true
+
+      - name: 离线分析链路（不调 LLM）
+        run: python main.py analyze --mock --no-notify --symbols sh600519,sz000858 --days-back 300
+
+  # ------------------------------------------------------------
+  # 4) 静态检查（不阻塞：风格问题不该拦住功能合并）
+  # ------------------------------------------------------------
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .

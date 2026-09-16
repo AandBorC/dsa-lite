@@ -1,0 +1,98 @@
+name: 每日分析并推送决策看板
+
+on:
+  schedule:
+    # 每个交易日 18:00（北京时间）= UTC 10:00
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mock:
+        description: "离线模式（不调用 LLM，用规则模拟）"
+        type: boolean
+        default: false
+      symbols:
+        description: "覆盖自选股（逗号分隔，留空用 config.yaml）"
+        required: false
+
+# public 仓库的 Actions 额度不限量；private 仓库免费账号 2000 分钟/月，够用
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 项目零强制依赖，这一步只为让 config.yaml / 邮件推送可用
+      - name: 安装可选依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: 打印环境信息
+        run: python -c "import sys; print(sys.version)"
+
+      - name: 每日分析
+        env:
+          # ---- LLM（不配则自动退回离线规则模拟器）----
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          # ---- 备用数据源的 Token ----
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # ---- 推送通道（填哪个用哪个）----
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          MOCK=""
+          if [ "${{ github.event.inputs.mock }}" = "true" ]; then MOCK="--mock"; fi
+          SYMS=""
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            SYMS="--symbols ${{ github.event.inputs.symbols }}"
+          fi
+          python main.py analyze $MOCK $SYMS --out data/latest_dashboard.md
+
+      # 把当日看板和信号台账提交回去 —— 台账是回测的样本来源，必须持久化
+      # 注意：这里只提交 data/ ，绝不提交 .env 或任何含 token 的文件
+      - name: 持久化台账与看板
+        run: |
+          git config user.name "dsa-lite-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/ || true
+          git diff --staged --quiet || git commit -m "chore: 每日信号台账 $(date +%F)"
+          git push || echo "无变更或推送失败，忽略"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-${{ github.run_number }}
+          path: data/
+          retention-days: 30
+
+  # 每周一次策略体检，防止策略在实盘中悄悄失效
+  weekly-validate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-5'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python main.py validate --strategy five_dim --out reports/validate.md
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validate-report
+          path: reports/
