@@ -41,11 +41,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from core import asof                                              # noqa: E402
 from core.backtest import BacktestConfig, BacktestEngine          # noqa: E402
-from core.fetchers import (CACHE_DIR, CsvCache, FetcherChain,      # noqa: E402
-                           NoDataSourceError, _importable, get_benchmark,
-                           to_ts_code)
-from core.llm import MockAnalyzer, _is_local_url, build_analyzer   # noqa: E402
+from core.fetchers import (CACHE_DIR, Bar, CsvCache, FetcherChain,  # noqa: E402
+                           NoDataSourceError, _apply_adjust, _importable,
+                           get_benchmark, to_ts_code)
+from core.llm import (MockAnalyzer, PROMPT_VERSION, _is_local_url,  # noqa: E402
+                      build_analyzer)
 from core.notify import Notifier                                   # noqa: E402
 from core.report import (render_backtest_summary, render_dashboard,  # noqa: E402
                          render_trades)
@@ -193,7 +195,7 @@ def make_strategy(kind: str, cfg: dict, analyzer=None, ledger_signals=None):
     if kind == "llm":
         if analyzer is None:
             raise RuntimeError("llm 策略需要 analyzer")
-        return LLMStrategy(analyzer, cache=SignalCache(), prompt_version="v1")
+        return LLMStrategy(analyzer, cache=SignalCache(), prompt_version=PROMPT_VERSION)
     if kind == "ledger":
         if not ledger_signals:
             raise RuntimeError("台账为空，先跑 analyze 积累信号")
@@ -284,12 +286,29 @@ def _snap(sym, bars, i):
 def _load_bars(cfg: dict, symbols: list[str], args) -> tuple[dict, list]:
     chain = make_chain(cfg)
     start, end = date_range(cfg, days_back=getattr(args, "days_back", 700))
+    as_of = _as_of(args)
     bars, sources = chain.fetch_many(symbols, start, end, adjust=cfg["adjust"],
-                                     force_refresh=getattr(args, "refresh", False))
-    bench = get_benchmark(start, end, cfg["benchmark"], chain)
-    log.info("拿到 %d 只标的（来源 %s），基准 %d 根",
-             len(bars), set(sources.values()), len(bench))
+                                     force_refresh=getattr(args, "refresh", False),
+                                     as_of=as_of)
+    bench = get_benchmark(start, end, cfg["benchmark"], chain, as_of=as_of)
+    log.info("拿到 %d 只标的（来源 %s），基准 %d 根%s",
+             len(bars), set(sources.values()), len(bench),
+             f"，时点门控 as_of={as_of}" if as_of else "")
+    if chain.audit is not None and chain.audit.dirty:
+        for line in chain.audit.summary():
+            log.warning("时点审计 | %s", line)
     return bars, bench
+
+
+def _as_of(args) -> str | None:
+    """从命令行取 as_of，顺手校验格式（写错了要立刻报，不能当成 None 静默放行）。"""
+    raw = getattr(args, "as_of", None)
+    if not raw:
+        return None
+    try:
+        return asof.norm(raw)
+    except ValueError as exc:
+        raise SystemExit(f"--as-of 格式无法识别：{raw}（应形如 2025-06-20）") from exc
 
 
 def cmd_backtest(args, cfg: dict) -> int:
@@ -301,7 +320,7 @@ def cmd_backtest(args, cfg: dict) -> int:
 
     st = make_strategy(args.strategy, cfg)
     engine = BacktestEngine(st, make_backtest_cfg(cfg))
-    result = engine.run(bars, bench)
+    result = engine.run(bars, bench, as_of=_as_of(args))
 
     print(render_backtest_summary(result))
     if args.show_trades:
@@ -345,7 +364,7 @@ def cmd_validate(args, cfg: dict) -> int:
         min_trades_for_verdict=args.min_trades or vcfg.get("min_trades", 20))
 
     log.info("开始体检：策略=%s 标的=%d 只 切分=%.0f%%", st.name, len(bars), validator.is_ratio * 100)
-    result, report = validator.validate(st, bars, bench)
+    result, report = validator.validate(st, bars, bench, as_of=_as_of(args))
 
     md = render_validation(report, result)
     print(render_backtest_summary(result))
@@ -385,7 +404,7 @@ def cmd_compare(args, cfg: dict) -> int:
                 log.warning("跳过策略 %s: %s", n, exc)
 
     validator = StrategyValidator(make_backtest_cfg(cfg), is_ratio=args.split or 0.7)
-    rows = validator.compare(strategies, bars, bench)
+    rows = validator.compare(strategies, bars, bench, as_of=_as_of(args))
 
     header = ("| 排名 | 策略 | 累计% | 年化% | 超额% | 笔数 | 胜率% | 盈亏比 | 回撤% | "
               "夏普 | 期望% | 显著 | 评级 |")
@@ -717,6 +736,133 @@ def cmd_ledger(args, cfg: dict) -> int:
 
 
 # ============================================================
+# asof —— 时点审计：这次运行「本不该看到」哪些东西
+# ============================================================
+
+# 真实的茅台除权样本，用来演示「前复权基准日」的时点问题。
+# 因子不靠外部数据源给，而是从除权事件本身反解出来（推导见 tests/test_adjust.py），
+# 保证这段演示在任何机器上都能跑，且数字是真实的。
+_ADJ_DEMO = {
+    "event_date": "2025-06-26",       # 除权日
+    "probe_date": "2025-06-25",       # 探针日：除权的前一天
+    "raw_close": 1435.86,             # tushare 不复权收盘
+    "ex_close_ref": 1408.26,          # tushare 给的除权后参考价
+    "tencent_qfq": 1356.28,           # 腾讯前复权（独立源，用来验证算法而非论证观点）
+    "latest_date": "2026-09-15",
+    "latest_factor": 8.6463,
+    "latest_raw": 1272.75,
+}
+
+
+def _try_fetch(chain, sym, start, end, cfg, as_of):
+    """抓一次行情，失败不抛错（审计命令要能容错，不能因为没网就什么都不给）。"""
+    try:
+        bars, src = chain.fetch(sym, start, end, adjust=cfg["adjust"], as_of=as_of)
+        return bars, src, ""
+    except Exception as exc:  # noqa: BLE001
+        return [], "", f"{type(exc).__name__}: {exc}"
+
+
+def cmd_asof(args, cfg: dict) -> int:
+    """
+    把「时点门控」从一句承诺变成一次可复跑的演示。
+
+    两段：
+      [1] 数据层截断   真实数据。请求区间被钉在 as_of 内之后，实际裁掉几根 K 线
+      [2] 复权基准日   A 股特有的一维：qfq 的分母该取 as_of 还是取「今天」
+    """
+    sym = args.symbol or _PROBE_SYMBOL
+    as_of = asof.norm(args.as_of) if args.as_of else asof.today()
+    start, end = date_range(cfg, days_back=args.days_back)
+    chain = make_chain(cfg)
+    kind = "历史运行" if asof.is_historical(as_of) else "实时运行"
+
+    print(f"# 时点审计 · {sym}")
+    print()
+    print(f"- as_of：`{as_of}`（{kind}）")
+    print(f"- 请求区间：`{asof.norm(start)}` ~ `{asof.norm(end)}`")
+    print()
+
+    # ---------- 1) 数据层截断 ----------
+    print("## 1. 数据层截断 —— as_of 之后才存在的 K 线")
+    print()
+    raw, src_raw, err_raw = _try_fetch(chain, sym, start, end, cfg, None)
+    gated, src_g, err_g = _try_fetch(chain, sym, start, end, cfg, as_of)
+
+    if err_g or not gated:
+        print(f"⚠️ 无法取数（{err_g or '返回空'}），跳过本段 —— 这一段需要行情源可用")
+    else:
+        tail_raw = raw[-1].date if raw else "—"
+        tail_gated = gated[-1].date if gated else "—"
+        cut = len(raw) - len(gated)
+        pct_cut = (cut / len(raw) * 100) if raw else 0.0
+        print("| 口径 | 实际请求区间 | K线根数 | 末根日期 | 数据源 |")
+        print("|------|------------|--------|---------|--------|")
+        print(f"| 未门控 | {asof.norm(start)} ~ {asof.norm(end)} | {len(raw)} | {tail_raw} | {src_raw or '—'} |")
+        print(f"| 门控后 | {asof.norm(start)} ~ {as_of} | {len(gated)} | {tail_gated} | {src_g or '—'} |")
+        print()
+        if cut > 0:
+            print(f"**{cut} 根 K 线（{pct_cut:.1f}%）被挡在门外** —— "
+                  f"它们在 {as_of} 当天还不存在，却足以污染均线、量比和区间位置。")
+        else:
+            print("本次 as_of 与数据末尾重合，没有可裁的 K 线 —— 门控是空转的。")
+        print()
+        print("注意：请求区间在数据层就被压缩了，**未来数据连请求都没发出去**。")
+        print("对带限流的数据源（如 tushare adj_factor 1 次/小时），这不是小事。")
+
+    # ---------- 2) 复权基准日 ----------
+    print()
+    print("## 2. 复权基准日 —— A 股特有的那一维")
+    print()
+    d = _ADJ_DEMO
+    ratio = d["raw_close"] / d["ex_close_ref"]              # adj_new / adj_old
+    adj_old = d["latest_factor"] / (d["raw_close"] / d["tencent_qfq"])
+    adj_new = adj_old * ratio
+    factors = {
+        d["probe_date"]: adj_old,
+        d["event_date"]: adj_new,
+        d["latest_date"]: d["latest_factor"],
+    }
+    bars = [Bar(date=d["probe_date"], open=d["raw_close"], close=d["raw_close"],
+                high=d["raw_close"], low=d["raw_close"], volume=0.0, amount=0.0,
+                pct_chg=0.0, turnover=0.0, amplitude=0.0),
+            Bar(date=d["latest_date"], open=d["latest_raw"], close=d["latest_raw"],
+                high=d["latest_raw"], low=d["latest_raw"], volume=0.0, amount=0.0,
+                pct_chg=0.0, turnover=0.0, amplitude=0.0)]
+
+    p_asof = _apply_adjust(bars, factors, "qfq", as_of=d["probe_date"])[0].close
+    p_today = _apply_adjust(bars, factors, "qfq", as_of=None)[0].close
+    drift = (p_today / p_asof - 1) * 100
+
+    print(f"样本：{d['event_date']} 除权（因子 {adj_old:.4f} → {adj_new:.4f}，"
+          f"跳变 {(ratio - 1) * 100:.3f}%）")
+    print(f"探针日：{d['probe_date']}（除权**前**一天）")
+    print()
+    print("| 基准日取法 | 探针日收盘价 | 说明 |")
+    print("|-----------|-------------|------|")
+    print(f"| `as_of={d['probe_date']}` | **{p_asof:.2f}** | 当天交易所显示的价格 |")
+    print(f"| 「今天」最新因子 {d['latest_factor']:.4f} | {p_today:.2f} | 含 {d['event_date']} 那次除权 |")
+    print()
+    print(f"**偏差 {drift:+.2f}%** —— 这 {abs(drift):.2f}% 全部来自 {d['event_date']} 的除权，"
+          f"而在 {d['probe_date']} 那天它还**没有发生**。")
+    print(f"（顺带验证算法没错：今天口径 {p_today:.2f} 与腾讯前复权 "
+          f"{d['tencent_qfq']:.2f} 一致 —— 这正是「用最新因子」的标准结果。）")
+    print()
+    print("### 这个偏差影响什么、不影响什么")
+    print()
+    print("| | 影响 |")
+    print("|---|---|")
+    print("| 日收益率序列 | 不受影响（复权是等比缩放，缩放系数约掉） |")
+    print("| 绝对价位 | **受影响**：止损价、目标价、「突破某价位」类规则都按绝对价算 |")
+    print("| 跨次运行一致性 | **受影响**：每次分红后基准日漂移，同一段历史算出不同曲线 |")
+    print("| 将来接入的新闻/基本面 | **受影响**：那是另一维，见 `core/asof.py` 的 filter_dated |")
+    print()
+    print("所以正确做法不是「复权了就行」，而是**把基准日钉在 as_of** —— "
+          "或者干脆回测统一用后复权（基准固定在最早一日，天然不随时间漂移）。")
+    return 0
+
+
+# ============================================================
 # 入口
 # ============================================================
 
@@ -728,7 +874,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="示例：\n"
                "  python main.py analyze --mock\n"
                "  python main.py validate --strategy five_dim --split 0.7 --out reports/validate.md\n"
-               "  python main.py compare --strategies ma_cross,five_dim,rsi_reversion\n")
+               "  python main.py compare --strategies ma_cross,five_dim,rsi_reversion\n"
+               "  python main.py asof --as-of 2025-06-20        # 看这次运行本不该看到哪些数据\n")
     p.add_argument("--config", default="config.yaml", help="配置文件路径")
     p.add_argument("-v", "--verbose", action="store_true", help="详细日志")
     sub = p.add_subparsers(dest="cmd")
@@ -771,6 +918,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="跳过 tushare 限流接口（省下每小时一次的配额）")
     d.add_argument("--mock", action="store_true", help="只验证离线模拟器")
     d.add_argument("--out", default="", help="报告输出路径")
+
+    s = sub.add_parser("asof", help="时点审计：这次运行本不该看到哪些数据")
+    s.add_argument("--symbol", default="", help="探测标的，默认 sh600519")
+    s.add_argument("--as-of", default="", metavar="YYYY-MM-DD",
+                   help="审计时点，默认今天")
+    s.add_argument("--days-back", type=int, default=400)
+    s.add_argument("--refresh", action="store_true")
     return p
 
 
@@ -778,6 +932,8 @@ def _add_common(sp) -> None:
     sp.add_argument("--symbols", help="逗号分隔标的，默认取配置 watchlist")
     sp.add_argument("--days-back", type=int, default=700)
     sp.add_argument("--refresh", action="store_true")
+    sp.add_argument("--as-of", default="", metavar="YYYY-MM-DD",
+                    help="时点门控：只使用该日期及之前可见的数据")
     sp.add_argument("--out", default="")
 
 
@@ -797,6 +953,7 @@ def main() -> int:
         "doctor": cmd_doctor,
         "analyze": cmd_analyze, "backtest": cmd_backtest,
         "validate": cmd_validate, "compare": cmd_compare, "ledger": cmd_ledger,
+        "asof": cmd_asof,
     }.get(args.cmd)
     if handler is None:
         print(f"未知命令: {args.cmd}")

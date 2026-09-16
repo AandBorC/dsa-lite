@@ -101,9 +101,10 @@ class StrategyValidator:
     # ---------- 主入口 ----------
 
     def validate(self, strategy, bars_by_symbol: dict, benchmark: Optional[list] = None,
-                 name: Optional[str] = None) -> tuple[BacktestResult, ValidationReport]:
+                 name: Optional[str] = None,
+                 as_of: Optional[str] = None) -> tuple[BacktestResult, ValidationReport]:
         engine = BacktestEngine(strategy, self.cfg)
-        result = engine.run(bars_by_symbol, benchmark)
+        result = engine.run(bars_by_symbol, benchmark, as_of=as_of)
         report = self._build_report(result, bars_by_symbol, benchmark, name)
         return result, report
 
@@ -258,11 +259,12 @@ class StrategyValidator:
     # ---------- 多策略横向对比 ----------
 
     def compare(self, strategies: list, bars_by_symbol: dict,
-                benchmark: Optional[list] = None) -> list[tuple[str, BacktestResult, ValidationReport]]:
+                benchmark: Optional[list] = None,
+                as_of: Optional[str] = None) -> list[tuple[str, BacktestResult, ValidationReport]]:
         out = []
         for st in strategies:
             log.info("评估策略: %s", st.name)
-            r, rep = self.validate(st, bars_by_symbol, benchmark)
+            r, rep = self.validate(st, bars_by_symbol, benchmark, as_of=as_of)
             out.append((st.name, r, rep))
         out.sort(key=lambda x: x[1].metrics.sharpe, reverse=True)
         return out
@@ -281,6 +283,10 @@ def render_validation(rep: ValidationReport, result: BacktestResult) -> str:
     A(f"- 回测区间：{rep.period[0]} ~ {rep.period[1]}")
     A(f"- 综合评级：**{rep.grade}**")
     A(f"- 基准对比：{rep.benchmark_note}")
+    # 报告是要存档、要贴进季度体检表的。不写清时点，三个月后没人说得清
+    # 这份数字是在哪个数据边界上算出来的 —— 尤其复权基准会随时间漂移。
+    A(f"- 时点门控：`as_of={result.as_of}`" if result.as_of
+      else "- 时点门控：**未指定 as_of**（不额外截断，时点正确性依赖数据区间）")
     A("")
     if "样本不足" in rep.grade:
         A("> ⚠️ **交易样本不足，下表仅供参考，不构成对策略有效性的判断。**")

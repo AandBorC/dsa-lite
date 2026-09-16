@@ -34,6 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
+from . import asof
+
 log = logging.getLogger("fetchers")
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
@@ -401,6 +403,10 @@ class TushareFetcher:
 
     name = "tushare"
 
+    # 声明自己会消费 as_of（FetcherChain 据此决定是否传参）。
+    # 只有 tushare 需要它：其余数据源的复权在服务端完成，本地不参与计算。
+    supports_as_of = True
+
     # 复权因子缓存有效期（天）。由分红频率决定：一年一两次的事件，周级刷新足够，
     # 同时把「1 次/小时」的限流影响降到零。
     ADJ_TTL_DAYS = 7.0
@@ -465,7 +471,8 @@ class TushareFetcher:
     # ---------------- 抓取 ----------------
 
     def fetch(self, symbol: str, start: str, end: str,
-              adjust: str = "qfq", is_index: bool = False) -> list[Bar]:
+              adjust: str = "qfq", is_index: bool = False,
+              as_of: Optional[str] = None) -> list[Bar]:
         import tushare as ts
         ts.set_token(os.environ["TUSHARE_TOKEN"])
         pro = ts.pro_api()
@@ -489,10 +496,8 @@ class TushareFetcher:
 
         if adjust in ("qfq", "hfq"):
             adj = self._get_adj(pro, code)
-            base_date = max(adj)
-            bars = _apply_adjust(bars, adj, adjust)
-            log.info("[tushare] %s 复权口径 %s，基准日 %s（factor=%.4f）",
-                     symbol, adjust, base_date, adj[base_date])
+            bars = _apply_adjust(bars, adj, adjust, as_of=as_of)
+            log.info("[tushare] %s 复权口径 %s，as_of=%s", symbol, adjust, as_of or "未指定")
         return bars
 
     def _fill_turnover(self, pro, code: str, bars: list[Bar],
@@ -564,15 +569,26 @@ def _nearest_adj(adj: dict, sorted_dates: list[str], date: str) -> float:
     return adj[best]
 
 
-def _apply_adjust(bars: list[Bar], adj: dict, adjust: str) -> list[Bar]:
+def _apply_adjust(bars: list[Bar], adj: dict, adjust: str,
+                  as_of: Optional[str] = None) -> list[Bar]:
     """
     按复权因子重算价格序列。
 
-        qfq(t) = raw(t) × adj(t) / adj(最新)   回测用这个：
-                                               最新价保持原值，历史价按分红比例缩回去
+        qfq(t) = raw(t) × adj(t) / adj(基准日)   回测用这个：
+                                                 基准日当天保持原值，历史价按分红比例缩回去
         hfq(t) = raw(t) × adj(t) / adj(最早)
 
-    为什么不对 pct_chg 重算：前复权是等比例缩放，
+    【时点纪律】前复权的基准日不能无脑取「最新」。
+
+    adj(最新) 里的「最新」是**今天**。若 as_of 落在某个分红除权日之前，
+    那次除权在 as_of 当天还没有发生，却已经被用来缩放历史价格 ——
+    这就是把未来的除权信息注入了历史价。传入 as_of 后，基准日会被
+    锁到「as_of 当天能看到的最后一个因子」，与当时的真实价格口径一致。
+
+    后复权天然没有这个问题（基准固定在最早一日，不随时间移动），
+    所以严格回测也可以直接用 hfq —— 这是最省事的正确做法。
+
+    为什么不对 pct_chg 重算：复权是等比例缩放，
     任何一天的涨跌幅在数学上都不变；而 tushare 的 pct_chg
     本身就是除权调整后的正确值，重算反而会引入舍入误差。
 
@@ -582,7 +598,21 @@ def _apply_adjust(bars: list[Bar], adj: dict, adjust: str) -> list[Bar]:
     if not adj or adjust not in ("qfq", "hfq"):
         return bars
     dates = sorted(adj)
-    base = adj[dates[-1]] if adjust == "qfq" else adj[dates[0]]
+
+    if adjust == "qfq":
+        base_date = dates[-1]
+        if as_of is not None:
+            a = asof.norm(as_of)
+            visible = [d for d in dates if d <= a]
+            # as_of 早于因子表起点：只能外推（下面会发警告），取最早因子
+            base_date = visible[-1] if visible else dates[0]
+            if base_date != dates[-1]:
+                log.info(
+                    "qfq 基准日按时点锁定为 %s（因子表最新为 %s，"
+                    "as_of 之后发生的除权不参与本次复权）", base_date, dates[-1])
+        base = adj[base_date]
+    else:
+        base = adj[dates[0]]
     if not base:
         return bars
 
@@ -741,6 +771,8 @@ class FetcherChain:
         self.use_cache = use_cache
         self.last_errors: dict[str, str] = {}
         self.last_source: str = ""
+        # 最近一次 fetch 的时点审计台账（as_of 未指定时为 None）
+        self.audit: Optional[asof.Audit] = None
         self._instances: dict[str, object] = {}
 
     def _get(self, name: str):
@@ -749,11 +781,44 @@ class FetcherChain:
             self._instances[name] = cls() if cls else None
         return self._instances[name]
 
+    def _emit(self, bars: list[Bar], sym: str, source: str) -> list[Bar]:
+        """
+        数据层的统一出口 —— 无论来源是网络、缓存还是过期缓存，都在这里裁一次。
+
+        「不信任上游」是刻意的：缓存路径、降级路径、将来的新数据源
+        都会经过这里，加一处等于加所有。
+        """
+        if self.audit is None:
+            return bars
+        return asof.clip_bars(bars, self.audit.as_of,
+                              label=f"{sym}/{source}", audit=self.audit)
+
     def fetch(self, symbol: str, start: str, end: str,
               adjust: str = "qfq", is_index: bool = False,
-              force_refresh: bool = False) -> tuple[list[Bar], str]:
+              force_refresh: bool = False,
+              as_of: Optional[str] = None) -> tuple[list[Bar], str]:
         self.last_errors = {}
+        # 台账的生命周期：as_of 变了就换一本。
+        # 单次调用时每次都重置；批量抓取时由 fetch_many 预先建好，
+        # 这里复用同一本 —— 否则每只标的都会把前一只的裁剪记录冲掉。
+        if as_of is None:
+            self.audit = None
+        elif self.audit is None or self.audit.as_of != asof.norm(as_of):
+            self.audit = asof.Audit(as_of=as_of)
         sym = normalize_symbol(symbol)
+
+        # 0) 时点门控第一道：请求区间本身钉在 as_of 内。
+        #    未来数据连请求都不发出去 —— 从源头断掉泄漏，也顺手省下数据源配额
+        #    （对 tushare 这种带限流的源，这不是小事）。
+        if as_of is not None:
+            req_s, req_e = asof.clip_range(start, end, as_of)
+            if (req_s, req_e) != (start, end):
+                log.info("[%s] 时点门控：请求区间 %s~%s → %s~%s",
+                         sym, start, end, req_s, req_e)
+            if asof.norm(start) > self.audit.as_of:
+                self.audit.note(f"请求区间起点 {asof.norm(start)} 晚于 as_of，"
+                                f"整体压缩为空区间（取不到数据是正确结果）")
+            start, end = req_s, req_e
 
         # 1) 缓存优先（必须同时满足：未过期 且 已覆盖请求区间）
         if self.use_cache and not force_refresh and self.cache.is_fresh(sym, adjust):
@@ -762,7 +827,7 @@ class FetcherChain:
             if cov is not None:
                 log.info("[%s] 命中本地缓存 %d 根", sym, len(cov))
                 self.last_source = "cache"
-                return cov, "cache"
+                return self._emit(cov, sym, "cache"), "cache"
 
         # 2) 依次降级
         for name in self.priority:
@@ -773,7 +838,11 @@ class FetcherChain:
                 self.last_errors[name] = "依赖未安装或未配置 Token"
                 continue
             try:
-                bars = inst.fetch(sym, start, end, adjust=adjust, is_index=is_index)
+                # 只有声明了 supports_as_of 的源才需要这个参数
+                # （目前只有 tushare：复权在本地算，基准日必须时点化）
+                extra = {"as_of": as_of} if getattr(inst, "supports_as_of", False) else {}
+                bars = inst.fetch(sym, start, end, adjust=adjust,
+                                  is_index=is_index, **extra)
                 if not bars:
                     raise RuntimeError("返回 0 根K线")
                 if self.use_cache:
@@ -784,7 +853,7 @@ class FetcherChain:
                 log.info("[%s] 由 %s 提供 %d 根K线", sym, name, len(bars))
                 self.last_source = name
                 self.last_errors.pop(name, None)
-                return bars, name
+                return self._emit(bars, sym, name), name
             except Exception as exc:  # noqa: BLE001
                 self.last_errors[name] = f"{type(exc).__name__}: {exc}"
                 log.warning("[%s] %s 失败: %s", sym, name, exc)
@@ -794,15 +863,22 @@ class FetcherChain:
         if self.use_cache:
             cached = self.cache.read(sym, adjust)
             if cached:
-                log.warning("[%s] 全部数据源失败，使用过期缓存 %d 根", sym, len(cached))
+                # 过期缓存同样要切到请求区间 —— 这里原本是「原样返回整段」，
+                # 越界的尾巴就是未来数据。降级路径最容易漏，也最容易出事。
+                sliced = _coverage(cached, start, end) or cached
+                log.warning("[%s] 全部数据源失败，使用过期缓存 %d 根%s",
+                            sym, len(sliced),
+                            "" if len(sliced) == len(cached) else
+                            f"（已从 {len(cached)} 根切到请求区间）")
                 self.last_source = "cache(stale)"
-                return cached, "cache(stale)"
+                return self._emit(sliced, sym, "cache(stale)"), "cache(stale)"
 
         raise NoDataSourceError(sym, self.last_errors)
 
     def fetch_many(self, symbols: Iterable[str], start: str, end: str,
                    adjust: str = "qfq", is_index: bool = False,
-                   force_refresh: bool = False) -> tuple[dict[str, list[Bar]], dict[str, str]]:
+                   force_refresh: bool = False,
+                   as_of: Optional[str] = None) -> tuple[dict[str, list[Bar]], dict[str, str]]:
         """
         批量抓取。单只失败不中断整体，失败清单写日志并跳过。
 
@@ -810,10 +886,15 @@ class FetcherChain:
         """
         sym_list = list(symbols)
         result, sources = {}, {}
+        # 批量抓取要累积审计：先建好台账，循环里的 fetch 会复用它。
+        # 不这么做的话，「裁掉了多少」只会剩下最后一只标的的数字 ——
+        # 审计漏报比不报更糟，因为它看起来是完整的。
+        self.audit = asof.Audit(as_of=as_of) if as_of is not None else None
         for idx, s in enumerate(sym_list):
             try:
                 bars, src = self.fetch(s, start, end, adjust=adjust,
-                                       is_index=is_index, force_refresh=force_refresh)
+                                       is_index=is_index, force_refresh=force_refresh,
+                                       as_of=as_of)
                 result[s] = bars
                 sources[s] = src
             except Exception as exc:  # noqa: BLE001
@@ -830,17 +911,20 @@ _CHAIN = FetcherChain()
 
 def get_bars(symbol: str, start: str, end: str, adjust: str = "qfq",
              is_index: bool = False, force_refresh: bool = False,
-             chain: Optional[FetcherChain] = None) -> tuple[list[Bar], str]:
+             chain: Optional[FetcherChain] = None,
+             as_of: Optional[str] = None) -> tuple[list[Bar], str]:
     ch = chain or _CHAIN
     return ch.fetch(symbol, start, end, adjust=adjust, is_index=is_index,
-                    force_refresh=force_refresh)
+                    force_refresh=force_refresh, as_of=as_of)
 
 
 def get_benchmark(start: str, end: str, code: str = "sh000300",
-                  chain: Optional[FetcherChain] = None) -> list[Bar]:
+                  chain: Optional[FetcherChain] = None,
+                  as_of: Optional[str] = None) -> list[Bar]:
     """基准指数（默认沪深300），失败返回空列表而不是抛错。"""
     try:
-        bars, _ = (chain or _CHAIN).fetch(code, start, end, adjust="", is_index=True)
+        bars, _ = (chain or _CHAIN).fetch(code, start, end, adjust="",
+                                          is_index=True, as_of=as_of)
         return bars
     except Exception as exc:  # noqa: BLE001
         log.warning("基准 %s 获取失败: %s", code, exc)

@@ -47,6 +47,9 @@ jobs:
       - name: 复权算法验收
         run: python tests/test_adjust.py
 
+      - name: 时点门控验收
+        run: python tests/test_lookahead.py
+
       - name: 语法与导入检查
         run: python -m compileall -q main.py core tests
 
@@ -54,6 +57,7 @@ jobs:
         run: |
           python main.py --help
           python main.py doctor --help
+          python main.py asof --help
 
   # ------------------------------------------------------------
   # 2) 多版本矩阵：3.10 是 requires-python 的下限，3.13 是当前
@@ -84,9 +88,12 @@ jobs:
       - name: 复权算法验收
         run: python tests/test_adjust.py
 
+      - name: 时点门控验收
+        run: python tests/test_lookahead.py
+
       - name: 导入检查（有 pyyaml 时 config.yaml 走真实解析路径）
         run: |
-          python -c "import core.backtest, core.fetchers, core.llm, core.validator, core.strategies, core.indicators; print('imports ok')"
+          python -c "import core.asof, core.backtest, core.fetchers, core.llm, core.validator, core.strategies, core.indicators; print('imports ok')"
           python - <<'PY'
           import main
           cfg = main.load_config("config.yaml")

@@ -34,6 +34,7 @@ import statistics
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
+from . import asof
 from .indicators import drawdown_series
 from .signals import Action, Signal
 
@@ -179,6 +180,7 @@ class BacktestResult:
     warnings: list[str] = field(default_factory=list)
     period: tuple[str, str] = ("", "")
     strategy_name: str = ""
+    as_of: str = ""            # 本次运行的时点（空 = 未指定门控）
 
     def in_sample_split(self, ratio: float = 0.7) -> tuple["BacktestResult", "BacktestResult"]:
         """按时间切分为样本内 / 样本外两份结果，用于过拟合检测。"""
@@ -210,14 +212,39 @@ class BacktestEngine:
     # ---------- 入口 ----------
 
     def run(self, bars_by_symbol: dict[str, list],
-            benchmark_bars: Optional[list] = None) -> BacktestResult:
+            benchmark_bars: Optional[list] = None,
+            as_of: Optional[str] = None) -> BacktestResult:
         cfg = self.cfg
         result = BacktestResult(metrics=Metrics(), strategy_name=self.strategy.name)
+        result.as_of = asof.norm(as_of) if as_of is not None else ""
 
         symbols = [s for s, b in bars_by_symbol.items() if b]
         if not symbols:
             result.warnings.append("无可用K线数据")
             return result
+
+        # ---------------- 时点门控：数据层最后一道关 ----------------
+        # 策略只能读 bars[:i+1] 是「索引约束」，它挡不住进来的数据本身就带
+        # as_of 之后的 K 线（缓存回退、多源合并、将来接入的新闻都可能带）。
+        # 这里做的是「数据约束」：越界的 bar 根本不存在于本次运行里。
+        if as_of is not None:
+            audit = asof.Audit(as_of=as_of)
+            bars_by_symbol = {
+                s: asof.clip_bars(b, as_of, label=f"{s}", audit=audit)
+                for s, b in bars_by_symbol.items()}
+            symbols = [s for s in symbols if bars_by_symbol.get(s)]
+            if benchmark_bars:
+                benchmark_bars = asof.clip_bars(benchmark_bars, as_of,
+                                                label="benchmark", audit=audit)
+            if not symbols:
+                result.warnings.append(f"时点门控后无可用K线（as_of={audit.as_of}）")
+                return result
+            if audit.dirty:
+                result.warnings.append("时点门控生效：" + "；".join(audit.summary()[1:]))
+        else:
+            # 门控没开也必须说一声 —— 静默地"没有门控"比门控裁掉数据更危险
+            result.warnings.append(
+                "未指定 as_of：本次回测不额外截断数据，时点正确性依赖调用方的数据区间")
 
         calendar = sorted({b.date for s in symbols for b in bars_by_symbol[s]})
         if len(calendar) < 30:
@@ -721,4 +748,5 @@ def _rebuild(src: BacktestResult, trades: list[Trade], name: str) -> BacktestRes
     return BacktestResult(
         metrics=m, trades=trades, equity_curve=curve, equity_values=vals,
         equity_dates=[d for d, _ in curve], strategy_name=name,
+        as_of=src.as_of,
         period=(trades[0].entry_date, trades[-1].exit_date) if trades else ("", ""))
