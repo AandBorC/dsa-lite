@@ -13,6 +13,10 @@ on:
       symbols:
         description: "覆盖自选股（逗号分隔，留空用 config.yaml）"
         required: false
+      debate:
+        description: "启用多空辩论出决策（成本约为单轮的 3 倍，默认关）"
+        type: boolean
+        default: false
 
 # public 仓库的 Actions 额度不限量；private 仓库免费账号 2000 分钟/月，够用
 permissions:
@@ -59,7 +63,11 @@ jobs:
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
             SYMS="--symbols ${{ github.event.inputs.symbols }}"
           fi
-          python main.py analyze $MOCK $SYMS --out data/latest_dashboard.md
+          # 辩论是可选路径：一次决策 2*轮数+2 次调用，不该在定时任务里默认开。
+          # 需要时手动触发并勾上 debate。
+          DEB=""
+          if [ "${{ github.event.inputs.debate }}" = "true" ]; then DEB="--debate"; fi
+          python main.py analyze $MOCK $SYMS $DEB --out data/latest_dashboard.md
 
       # 结算旧判断 → 写教训。放在 analyze 之后、提交之前：
       # 分析只负责写下新判断，结算必须等验证期走完，两者是不同的时间动作。
@@ -69,10 +77,10 @@ jobs:
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         run: python main.py reflect || echo "结算未完成（数据源问题或验证期未满），忽略"
 
-      # 把当日看板、信号台账、反思记忆提交回去 —— 三者都是资产：
-      # 台账是回测的样本来源，记忆是积累下来的全部教训，丢了都是从零开始
+      # 把当日看板、信号台账、反思记忆、辩论过程提交回去 —— 都是资产：
+      # 台账是回测样本，记忆是积累的教训，辩论过程是裁决的唯一解释，丢了都是从零开始
       # 注意：这里只提交 data/ ，绝不提交 .env 或任何含 token 的文件
-      - name: 持久化台账、记忆与看板
+      - name: 持久化台账、记忆、辩论过程与看板
         run: |
           git config user.name "dsa-lite-bot"
           git config user.email "bot@users.noreply.github.com"

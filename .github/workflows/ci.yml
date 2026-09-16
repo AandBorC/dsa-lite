@@ -29,6 +29,8 @@ jobs:
       # 记忆库必须导到临时目录：测试里分析的每一步都会写判断记录，
       # 落在仓库里就成了"假记忆"，而假记忆会被真的注入后续分析。
       DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
+      # 辩论过程同理：跑一次回测就往仓库里灌几百条记录，没人愿意 review
+      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +59,9 @@ jobs:
       - name: 反思记忆验收（重点：证明它不漏未来）
         run: python tests/test_memory.py
 
+      - name: 多空辩论验收（重点：证明它不会失控）
+        run: python tests/test_debate.py
+
       - name: 语法与导入检查
         run: python -m compileall -q main.py core tests
 
@@ -67,11 +72,17 @@ jobs:
           python main.py asof --help
           python main.py reflect --help
           python main.py memory --help
+          python main.py debate --help
+          python main.py analyze --help
 
       - name: 确认测试没有污染仓库
         run: |
           if [ -e data/memory ]; then
             echo "::error::测试往仓库里写了记忆文件："; ls -la data/memory
+            exit 1
+          fi
+          if [ -e data/debate ]; then
+            echo "::error::测试往仓库里写了辩论记录："; ls -la data/debate
             exit 1
           fi
           git diff --exit-code -- data/ledger/signals.csv \
@@ -87,6 +98,7 @@ jobs:
     timeout-minutes: 15
     env:
       DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
+      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     strategy:
       fail-fast: false
       matrix:
@@ -115,14 +127,18 @@ jobs:
       - name: 反思记忆验收
         run: python tests/test_memory.py
 
+      - name: 多空辩论验收
+        run: python tests/test_debate.py
+
       - name: 导入检查（有 pyyaml 时 config.yaml 走真实解析路径）
         run: |
-          python -c "import core.asof, core.backtest, core.fetchers, core.llm, core.memory, core.validator, core.strategies, core.indicators; print('imports ok')"
+          python -c "import core.asof, core.debate, core.backtest, core.fetchers, core.llm, core.memory, core.validator, core.strategies, core.indicators; print('imports ok')"
           python - <<'PY'
           import main
           cfg = main.load_config("config.yaml")
           assert cfg["strategy"], "config.yaml 未正确加载"
           assert cfg["fetcher_priority"], "fetcher_priority 缺失"
+          assert cfg["strategy_params"]["debate"]["max_rounds"] >= 1, "debate 配置缺失"
           print("config.yaml 解析 ok →", cfg["strategy"], "|", " → ".join(cfg["fetcher_priority"]))
           PY
 
@@ -138,6 +154,7 @@ jobs:
     continue-on-error: true
     env:
       DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
+      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     steps:
       - uses: actions/checkout@v4
 
@@ -150,6 +167,13 @@ jobs:
 
       - name: 离线分析链路（不调 LLM）
         run: python main.py analyze --mock --no-notify --symbols sh600519,sz000858 --days-back 300
+
+      - name: 辩论链路冒烟（演示命令必须能跑通）
+        run: |
+          echo "--- 跑一场辩论：两个顺序的裁决应当都打出来 ---"
+          python main.py debate --symbol sh600519 --mock --days-back 200
+          echo "--- 辩论进主链路（决策看板里应有「多空辩论」小节） ---"
+          python main.py analyze --debate --mock --no-notify --symbols sh600519 --days-back 200
 
       - name: 反射链路冒烟（判断 → 记忆 → 结算）
         run: |

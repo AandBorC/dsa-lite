@@ -45,6 +45,11 @@ log = logging.getLogger("llm")
 # 不升版，三个月后没人说得清那次回测用的是哪一版 prompt。
 PROMPT_VERSION = "v3"
 
+# 多空辩论是**另一套**提示词（三个角色各自的 system），且决策链路完全不同，
+# 所以给它独立的版本号，而不是把 v3 往上堆。
+# 这样台账能直接区分「单轮判断」与「辩论判断」，两者的回测结论不能混着比。
+DEBATE_PROMPT_VERSION = "d1"
+
 SYSTEM_PROMPT = """你是一名严格的A股短线交易分析师。你只能基于用户提供的量化指标做判断，禁止引用任何外部信息。
 
 时点纪律（比下面所有规则都优先）：
@@ -106,10 +111,14 @@ def build_prompt(symbol: str, snap, holding: bool = False,
 # 解析
 # ------------------------------------------------------------
 
-def parse_signal(text: str, symbol: str, date: str, score: float = 50.0) -> Optional[dict]:
+def extract_json(text: str) -> Optional[dict]:
     """
-    从模型输出里抠出 JSON。容忍三种常见脏格式：
+    从一段文本里抠出 JSON 对象。容忍三种常见脏格式：
     裸 JSON / ```json 包裹 / 前后有废话。
+
+    抽成独立函数是因为多空辩论的每一轮发言也要走这里。
+    解析器必须全项目只有一份实现 —— 否则「解析失败就降级」这条规则
+    会在两条路径上各自演化，最后变成两种行为。
     """
     if not text:
         return None
@@ -153,6 +162,11 @@ def parse_signal(text: str, symbol: str, date: str, score: float = 50.0) -> Opti
                         break
     log.warning("无法解析模型输出: %s", text[:200])
     return None
+
+
+def parse_signal(text: str, symbol: str, date: str, score: float = 50.0) -> Optional[dict]:
+    """解析单轮分析器的输出。语义等同 extract_json，保留原签名以免调用方改动。"""
+    return extract_json(text)
 
 
 def dict_to_signal(d: dict, symbol: str, date: str, model: str,
@@ -250,7 +264,7 @@ class LLMAnalyzer:
                 return s
 
         # 2) 调模型
-        raw_text = self._chat(prompt)
+        raw_text = self._chat(SYSTEM_PROMPT, prompt.split("\n---\n", 1)[-1])
         parsed = parse_signal(raw_text, snap.symbol, snap.date)
 
         # 3) 解析失败 → 降级 HOLD（绝不让脏数据进回测）
@@ -271,13 +285,39 @@ class LLMAnalyzer:
         return dict_to_signal(parsed, snap.symbol, snap.date, self.model,
                               PROMPT_VERSION, ref_price=snap.close)
 
-    def _chat(self, prompt: str) -> str:
+    def raw_chat(self, system: str, user: str, use_cache: bool = True) -> str:
+        """
+        裸调用：自定义 system，取回模型原文，不做 JSON 校验、不构造 Signal。
+
+        供多空辩论这类「同一份事实、多种角色提示词」的场景使用。
+        缓存键含 system 全文 —— 辩论的每一轮、每一种发言顺序各算一次独立调用，
+        这正是「重跑回测零成本且结果可复现」在辩论路径上依然成立的原因。
+        """
+        prompt = f"{system}\n---\n{user}"
+        if self.use_cache and use_cache:
+            hit = self.cache.get(self.model, prompt)
+            # 必须检查 _text：analyze() 往同一张缓存里写的是信号字典，
+            # 万一键撞上（同 system 同 user），也不能把信号当发言文本返回。
+            if hit is not None and "_text" in hit:
+                self.stats["cache_hits"] += 1
+                return hit["_text"]
+        text = self._chat(system, user)
+        if self.use_cache and use_cache:
+            self.cache.put(self.model, prompt, {"_text": text})
+            self.cache.flush()
+        return text
+
+    def _chat(self, system: str, user: str) -> str:
+        """
+        底层调用。system 与 user 分开传 ——
+        辩论的三个角色各有自己的 system，不能再共用一个模块级常量。
+        """
         payload = {
             "model": self.model,
             "temperature": self.temperature,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt.split("\n---\n", 1)[-1]},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
             "stream": False,
@@ -418,6 +458,17 @@ class MockAnalyzer:
             reason="规则模拟：" + (", ".join(reasons) if reasons else "中性"),
             meta={"snapshot": f, "entry_is_reference": True})
 
+    def raw_chat(self, system: str, user: str, use_cache: bool = True) -> str:
+        """
+        离线模拟的辩论发言。
+
+        必须是**确定性**的：一个每次给出不同答案的模拟器，会让
+        「同一输入 → 同一结论」这条测试变成空转。所以这里只根据
+        系统提示词里的角色 + 用户文本里的指标做纯函数推导，不引入随机数。
+        """
+        self.stats["calls"] += 1
+        return _mock_debate_reply(system, user)
+
 
 # ------------------------------------------------------------
 
@@ -436,6 +487,91 @@ def build_analyzer(kind: str = "auto", **kw):
         return a
     log.warning("未检测到 LLM_API_KEY，退回离线规则模拟器（MockAnalyzer）")
     return MockAnalyzer()
+
+
+# ------------------------------------------------------------
+# 离线辩论回复
+# ------------------------------------------------------------
+
+_ROLE_MARKERS = (("多头", "bull"), ("空头", "bear"), ("裁决", "judge"))
+
+
+def mock_role_of(system: str) -> str:
+    """从系统提示词判断这是哪个角色的调用。离线与测试都靠它分流。"""
+    for marker, role in _ROLE_MARKERS:
+        if marker in system:
+            return role
+    return "unknown"
+
+
+def _facts_from_text(text: str) -> dict:
+    """
+    从提示词里抠回几个关键指标。
+
+    取**第一处**匹配 —— 事实块永远排在发言记录之前，所以先匹配到的就是事实，
+    不会被某位辩手在论点里复述的数字覆盖。
+    """
+    out: dict = {}
+    for key, pat in (
+        ("收盘价", r"收盘价:\s*(-?[\d.]+)"),
+        ("MA20", r"MA20:\s*(-?[\d.]+)"),
+        ("MA60", r"MA60:\s*(-?[\d.]+)"),
+        ("RSI14", r"RSI14:\s*(-?[\d.]+)"),
+        ("60日区间位置", r"60日区间位置:\s*(-?[\d.]+)"),
+    ):
+        m = re.search(pat, text)
+        if m:
+            try:
+                out[key] = float(m.group(1))
+            except ValueError:
+                pass
+    return out
+
+
+def _mock_debate_reply(system: str, user: str) -> str:
+    """
+    纯函数式的离线辩论回复：同样的输入永远给出同样的输出。
+
+    多空两侧刻意朝各自方向偏，裁决者则**只看指标、完全不看发言顺序** ——
+    这正好让它成为顺序置换检验的对照线：机制正常时它必须被判为「顺序无关」。
+    """
+    role = mock_role_of(system)
+    f = _facts_from_text(user)
+    close, ma20, ma60 = f.get("收盘价"), f.get("MA20"), f.get("MA60")
+    rsi, pos = f.get("RSI14"), f.get("60日区间位置")
+
+    base = 50.0
+    base += 10 if (ma20 and close and close > ma20) else -10
+    base += 8 if (ma60 and close and close > ma60) else -8
+    if rsi is not None:
+        base -= max(0.0, (rsi - 60) * 0.8)     # 超买压分
+        base += max(0.0, (40 - rsi) * 0.8)     # 超卖加分
+    if pos is not None and pos > 90:
+        base -= 6                              # 贴近 60 日高点，追高扣分
+
+    if role == "bull":
+        s = min(100.0, base + 14)
+        return json.dumps({"action": "BUY" if s >= 62 else "HOLD",
+                           "score": round(s, 1), "concede": False,
+                           # 只陈述读到的数字，不下"占优/不足"这类结论 ——
+                           # 模拟器一旦输出与事实相反的断言，读演示的人就被误导了
+                           "point": f"多头视角：收盘{close}、MA20 {ma20}、RSI {rsi}，评分{s:.0f}"},
+                          ensure_ascii=False)
+    if role == "bear":
+        s = max(0.0, base - 14)
+        return json.dumps({"action": "SELL" if s <= 38 else "HOLD",
+                           "score": round(s, 1), "concede": False,
+                           "point": f"空头视角：RSI {rsi}、60日位置 {pos}、MA60 {ma60}，评分{s:.0f}"},
+                          ensure_ascii=False)
+    if role == "judge":
+        act = "BUY" if base >= 62 else ("SELL" if base <= 38 else "HOLD")
+        wb = max(0.0, min(1.0, base / 100))
+        return json.dumps({"action": act, "score": round(base, 1), "confidence": 0.5,
+                           "reason": f"按指标综合分{base:.0f}裁决，不依赖发言顺序",
+                           "weight_bull": round(wb, 2), "weight_bear": round(1 - wb, 2)},
+                          ensure_ascii=False)
+    return json.dumps({"action": "HOLD", "score": 50.0, "point": "未识别角色"},
+                      ensure_ascii=False)
 
 
 def _is_local_url(url: str) -> bool:

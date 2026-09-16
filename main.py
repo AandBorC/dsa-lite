@@ -48,6 +48,9 @@ sys.path.insert(0, str(ROOT))
 
 from core import asof, memory                                     # noqa: E402
 from core.backtest import BacktestConfig, BacktestEngine          # noqa: E402
+from core.debate import (DEBATE_PROMPT_VERSION, ORDER_BEAR_FIRST,  # noqa: E402
+                         ORDER_BULL_FIRST, DebateAnalyzer, DebateConfig,
+                         TranscriptStore, render_debate_audit)
 from core.fetchers import (CACHE_DIR, Bar, CsvCache, FetcherChain,  # noqa: E402
                            NoDataSourceError, _apply_adjust, _importable,
                            get_benchmark, to_ts_code)
@@ -198,17 +201,55 @@ def make_backtest_cfg(cfg: dict) -> BacktestConfig:
 
 def make_strategy(kind: str, cfg: dict, analyzer=None, ledger_signals=None,
                   memory_store=None):
-    """构造策略。llm 类型需要 analyzer；ledger 类型需要外部提供信号列表。"""
-    if kind == "llm":
+    """构造策略。llm / debate 类型需要 analyzer；ledger 类型需要外部提供信号列表。"""
+    if kind in ("llm", "debate"):
         if analyzer is None:
-            raise RuntimeError("llm 策略需要 analyzer")
-        return LLMStrategy(analyzer, cache=SignalCache(), prompt_version=PROMPT_VERSION,
-                           memory=memory_store)
+            raise RuntimeError(f"{kind} 策略需要 analyzer")
+        version = PROMPT_VERSION
+        if kind == "debate":
+            # 辩论是「另一种分析器」，所以策略层原样复用 LLMStrategy ——
+            # 记忆门控、分数闸门、台账、缓存全部共用。
+            # 两条路径的周边机制完全一致，回测比出来的差异才只可能来自
+            # 「单轮判断 vs 多空辩论」本身，而不是来自谁多接了一根线。
+            # 这里**不传 transcript_store**：回测不写辩论全文，免得跑一次回测
+            # 就往仓库里灌几百条记录。
+            analyzer = DebateAnalyzer(
+                analyzer, cfg=DebateConfig.from_dict(
+                    cfg.get("strategy_params", {}).get("debate")))
+            version = DEBATE_PROMPT_VERSION
+        st = LLMStrategy(analyzer, cache=SignalCache(), prompt_version=version,
+                         memory=memory_store)
+        # st.name 会自己变成 "debate"（LLMStrategy 按分析器的 stats_scope 判断），
+        # 这里不再重复设置 —— 同一件事只留一个真相来源。
+        return st
     if kind == "ledger":
         if not ledger_signals:
             raise RuntimeError("台账为空，先跑 analyze 积累信号")
         return LedgerStrategy(ledger_signals)
     return build_strategy(kind, **cfg.get("strategy_params", {}).get(kind, {}))
+
+
+def debate_config(args, cfg: dict) -> DebateConfig:
+    """
+    辩论配置的合并顺序：CLI 显式参数 > config.yaml > 内置默认。
+
+    config.yaml 里没有 debate 段时用默认值 —— 但**顺序字段默认值来自配置**，
+    所以「谁先发言」永远是个被写下来的决定，而不是某处的硬编码。
+    """
+    base = dict(cfg.get("strategy_params", {}).get("debate") or {})
+    if getattr(args, "debate_rounds", None):
+        base["max_rounds"] = args.debate_rounds
+    if getattr(args, "order", ""):
+        base["order"] = args.order
+    if getattr(args, "no_order_check", False):
+        base["order_check"] = False
+    return DebateConfig.from_dict(base)
+
+
+def wrap_debate(analyzer, args, cfg: dict, store: bool = True):
+    """把单轮分析器包成辩论分析器。store=True 时辩论全文落盘（仅 analyze/CLI 用）。"""
+    return DebateAnalyzer(analyzer, cfg=debate_config(args, cfg),
+                          transcript_store=TranscriptStore() if store else None)
 
 
 # ============================================================
@@ -233,6 +274,16 @@ def cmd_analyze(args, cfg: dict) -> int:
         return 2
 
     analyzer = build_analyzer("mock" if args.mock else cfg["analyzer"])
+    # 多空辩论是可选路径：默认仍走单轮判断。理由是成本 ——
+    # 辩论一次决策要 2*rounds+2 次调用，不该在用户没要求时悄悄翻几倍。
+    dab = wrap_debate(analyzer, args, cfg) if getattr(args, "debate", False) else None
+    if dab is not None:
+        analyzer = dab
+        c = dab.cfg
+        log.info("启用多空辩论：%d 轮（%d 次发言）%s，每次决策约 %d 次调用",
+                 c.max_rounds, c.turn_limit(),
+                 "，含顺序置换检验" if c.order_check else "，未做顺序置换检验",
+                 c.turn_limit() + (2 if c.order_check else 1))
     ledger = SignalLedger()
     signals = []
 
@@ -241,6 +292,7 @@ def cmd_analyze(args, cfg: dict) -> int:
     store = None if args.no_memory else MemoryStore()
     snaps: dict = {}
     mem_lines: list[str] = []
+    debate_rows: list = []
 
     # 持仓上下文：从台账里最近一次 BUY 推断（简单版）
     for sym, bars in bars_by_symbol.items():
@@ -272,6 +324,10 @@ def cmd_analyze(args, cfg: dict) -> int:
             # 「模型没学会」和「模型根本没收到」的唯一线索
             sig.meta["memory_lessons"] = ctx.visible_lesson_ids()
         signals.append(sig)
+        # 只留本次这几条：辩论结果全文很大，攒起来在长回测里会吃掉内存。
+        # analyze 一次只跑 watchlist 那么多只，足够。
+        if dab is not None and dab.last is not None:
+            debate_rows.append(dab.last)
 
     if not signals:
         log.error("未产出任何信号")
@@ -301,6 +357,11 @@ def cmd_analyze(args, cfg: dict) -> int:
         # 让记忆的介入在每日输出里可见 —— 一个静默的记忆注入和没注入，
         # 在结果上分不出来，在过程上必须分得出来。
         body += ("\n\n## 记忆注入\n\n" + "\n".join(f"- {x}" for x in mem_lines))
+    if dab is not None:
+        # 同理：一个"顺序没检验、裁决全失败"的静默辩论，最终信号上与没开辩论
+        # 长得一样。过程必须自报。
+        body += "\n\n## 多空辩论\n\n" + "\n".join(
+            f"- {x}" for x in render_debate_audit(dab, debate_rows))
 
     # 控制台既可能由 print 输出，也可能由 Notifier 的 console 通道输出 ——
     # 两者同时开会把看板打两遍，所以这里二选一。
@@ -407,9 +468,9 @@ def cmd_validate(args, cfg: dict) -> int:
         log.error("无数据，退出")
         return 2
 
-    if args.strategy == "llm":
+    if args.strategy in ("llm", "debate"):
         analyzer = build_analyzer("mock" if args.mock else cfg["analyzer"])
-        st = make_strategy("llm", cfg, analyzer=analyzer,
+        st = make_strategy(args.strategy, cfg, analyzer=analyzer,
                            memory_store=_memory_store(args))
     elif args.strategy == "ledger":
         st = make_strategy("ledger", cfg, ledger_signals=SignalLedger().read())
@@ -452,8 +513,8 @@ def cmd_compare(args, cfg: dict) -> int:
     strat_names = [s.strip() for s in args.strategies.split(",") if s.strip()]
     strategies = []
     for n in strat_names:
-        if n == "llm":
-            strategies.append(make_strategy("llm", cfg,
+        if n in ("llm", "debate"):
+            strategies.append(make_strategy(n, cfg,
                                             analyzer=build_analyzer("mock" if args.mock else
                                                                     cfg["analyzer"]),
                                             memory_store=_memory_store(args)))
@@ -972,6 +1033,82 @@ def cmd_memory(args, cfg: dict) -> int:
     return 0
 
 
+# ============================================================
+# debate —— 当场跑一场辩论，把「顺序」这件事摆出来
+# ============================================================
+
+def cmd_debate(args, cfg: dict) -> int:
+    """
+    跑一场多空辩论并打印全过程，重点是**两个顺序的裁决并排出现**。
+
+    存在的理由和 asof 子命令一样：**能被演示的正确性才守得住**。
+    「轮数由计数器硬判」和「结论不受发言顺序影响」如果只是文档里的一句话，
+    谁也没法核实；跑一遍，两侧的裁决就摆在那里，对不对自己看。
+
+    这个命令**不写记忆库、不写辩论台账**：analyze 才是唯一的写入入口。
+    想留档就 --out 写到文件。理由与记忆同源 ——
+    写入口一多，库就再也说不清哪条是实盘产出的、哪条是某次调试留下的。
+    """
+    symbols = [args.symbol] if args.symbol else cfg["watchlist"][:1]
+    symbols = [s.strip() for s in symbols if s.strip()]
+    start, end = date_range(cfg, days_back=args.days_back)
+    as_of = _as_of(args)
+
+    chain = make_chain(cfg)
+    bars_by_symbol, sources = chain.fetch_many(
+        symbols, start, end, adjust=cfg["adjust"],
+        force_refresh=args.refresh, as_of=as_of)
+    if not bars_by_symbol:
+        log.error("无数据，退出")
+        return 2
+
+    store = None if args.no_memory else MemoryStore()
+    # store=False：演示不落盘，见函数开头的说明
+    dab = wrap_debate(build_analyzer("mock" if args.mock else cfg["analyzer"]),
+                      args, cfg, store=False)
+
+    blocks: list[str] = []
+    for sym, bars in bars_by_symbol.items():
+        if len(bars) < 70:
+            log.warning("[%s] 仅 %d 根K线，不足 70 根，跳过", sym, len(bars))
+            continue
+        snap = _snap(sym, bars, len(bars) - 1)
+        block = ""
+        if store is not None:
+            ctx = store.get_past_context(sym, snap.date)
+            block = ctx.render()
+        try:
+            dab.analyze(snap, holding=False, memory_block=block)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[%s] 辩论失败: %s", sym, exc)
+            continue
+        res = dab.last
+        if res is None:
+            continue
+        blocks.append(res.render())
+        if block:
+            blocks.append("### 本次注入的记忆（按 learned_date 门控）\n\n" + block)
+
+    if not blocks:
+        log.error("未产出任何辩论")
+        return 2
+
+    md = "\n\n".join(blocks)
+    print(md)
+    print()
+    print("## 介入审计")
+    print()
+    for line in render_debate_audit(dab, [r for r in [dab.last] if r]):
+        print(f"- {line}")
+
+    if args.out:
+        out = ROOT / args.out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(md, encoding="utf-8")
+        log.info("辩论记录已写出 → %s", _rel(out))
+    return 0
+
+
 
 # ============================================================
 # asof —— 时点审计：这次运行「本不该看到」哪些东西
@@ -1111,8 +1248,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python main.py analyze --mock\n"
+               "  python main.py analyze --debate                # 用多空辩论出决策（成本约 3 倍）\n"
+               "  python main.py debate --symbol sh600519        # 当场跑一场辩论，看两个顺序的裁决\n"
                "  python main.py reflect                       # 把走完验证期的旧判断结算成教训\n"
                "  python main.py memory --symbol sz300750      # 看模型在这天到底看得见什么\n"
+               "  python main.py validate --strategy debate --mock   # 辩论 vs 单轮：有没有增量\n"
+               "  python main.py compare --strategies llm,debate,five_dim --mock\n"
                "  python main.py validate --strategy five_dim --split 0.7 --out reports/validate.md\n"
                "  python main.py compare --strategies ma_cross,five_dim,rsi_reversion\n"
                "  python main.py asof --as-of 2025-06-20        # 看这次运行本不该看到哪些数据\n")
@@ -1131,6 +1272,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="时点门控：按该日期回放分析（记忆也随之门控）")
     a.add_argument("--no-memory", action="store_true",
                    help="关闭反思记忆（作为对照组，用来验证记忆有没有用）")
+    a.add_argument("--debate", action="store_true",
+                   help="启用多空辩论。成本约为单轮的 2-3 倍（2*轮数+2 次调用）")
+    a.add_argument("--debate-rounds", type=int, default=0, help="辩论轮数，默认取配置")
+    a.add_argument("--order", default="", choices=["", ORDER_BULL_FIRST, ORDER_BEAR_FIRST],
+                   help="辩论先手，默认 bull_first")
+    a.add_argument("--no-order-check", action="store_true",
+                   help="跳过顺序置换检验：省一次裁决调用，代价是结论未经检验")
 
     b = sub.add_parser("backtest", help="基础回测")
     _add_common(b)
@@ -1141,7 +1289,7 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("validate", help="策略体检（五大指标+过拟合+显著性）")
     _add_common(v)
     v.add_argument("--strategy", default="five_dim",
-                   help="five_dim / ma_cross / rsi_reversion / llm / ledger")
+                   help="five_dim / ma_cross / rsi_reversion / llm / debate / ledger")
     v.add_argument("--split", type=float, default=0.0, help="样本内占比，默认 0.7")
     v.add_argument("--min-trades", type=int, default=0, help="判定所需最少交易笔数")
     v.add_argument("--mock", action="store_true")
@@ -1166,6 +1314,21 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--symbol", default="", help="给定时打印该标的在 --as-of 时点看到的记忆全文")
     m.add_argument("--as-of", default="", metavar="YYYY-MM-DD", help="时点，默认今天")
     m.add_argument("--tail", type=int, default=8, help="显示最近多少条教训")
+
+    db = sub.add_parser("debate", help="跑一场多空辩论，并排看两个顺序的裁决")
+    db.add_argument("--symbol", default="", help="只跑该标的，默认取 watchlist 第一个")
+    db.add_argument("--as-of", default="", metavar="YYYY-MM-DD", help="时点，默认今天")
+    db.add_argument("--days-back", type=int, default=400)
+    db.add_argument("--refresh", action="store_true")
+    db.add_argument("--debate-rounds", "--rounds", dest="debate_rounds", type=int,
+                    default=0, help="辩论轮数，默认取配置")
+    db.add_argument("--order", default="", choices=["", ORDER_BULL_FIRST, ORDER_BEAR_FIRST],
+                    help="先发言的一方，默认 bull_first")
+    db.add_argument("--no-order-check", action="store_true",
+                    help="跳过顺序置换检验（省一次调用，但结论将未经检验）")
+    db.add_argument("--mock", action="store_true", help="离线模式（不调 LLM）")
+    db.add_argument("--no-memory", action="store_true", help="不注入反思记忆")
+    db.add_argument("--out", default="", help="辩论记录输出路径")
 
     d = sub.add_parser("doctor", help="体检：环境 / 数据源 / LLM 通不通")
     d.add_argument("--symbol", default="", help="探测标的，默认 sh600519")
@@ -1192,6 +1355,14 @@ def _add_common(sp) -> None:
                     help="时点门控：只使用该日期及之前可见的数据")
     sp.add_argument("--no-memory", action="store_true",
                     help="关闭反思记忆注入（LLM 策略的对照组）")
+    # 辩论参数放在公共段：--strategy debate 时要能调轮数与顺序，
+    # 否则「配置在哪一层生效」这件事会变成只有读代码才知道
+    sp.add_argument("--debate-rounds", type=int, default=0,
+                    help="辩论轮数（--strategy debate 时生效）")
+    sp.add_argument("--order", default="", choices=["", ORDER_BULL_FIRST, ORDER_BEAR_FIRST],
+                    help="辩论先手（--strategy debate 时生效）")
+    sp.add_argument("--no-order-check", action="store_true",
+                    help="跳过顺序置换检验（--strategy debate 时生效）")
     sp.add_argument("--out", default="")
 
 
@@ -1212,6 +1383,7 @@ def main() -> int:
         "analyze": cmd_analyze, "backtest": cmd_backtest,
         "validate": cmd_validate, "compare": cmd_compare, "ledger": cmd_ledger,
         "asof": cmd_asof, "reflect": cmd_reflect, "memory": cmd_memory,
+        "debate": cmd_debate,
     }.get(args.cmd)
     if handler is None:
         print(f"未知命令: {args.cmd}")

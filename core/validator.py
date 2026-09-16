@@ -112,6 +112,14 @@ class StrategyValidator:
         stats = getattr(strategy, "stats", None)
         if isinstance(stats, dict):
             report.strategy_stats = dict(stats)
+        # 辩论统计挂在**分析器**上，不在策略上（策略层只报记忆）。
+        # 靠 stats_scope 认领，别靠键名猜 —— 两边的键名有重叠（都有 calls），
+        # 混在一起会把辩论调用数当成模型调用数。
+        az = getattr(strategy, "analyzer", None)
+        if getattr(az, "stats_scope", "") == "debate":
+            az_stats = getattr(az, "stats", None)
+            if isinstance(az_stats, dict):
+                report.strategy_stats["debate"] = dict(az_stats)
         return result, report
 
     # ---------- 报告构建 ----------
@@ -307,6 +315,21 @@ def render_validation(rep: ValidationReport, result: BacktestResult) -> str:
                   "记忆库为空或全部判断仍在验证期。这不是「记忆无效」，是还没积累到。")
         else:
             A("- 反思记忆：**未注入**（本次运行未开启或策略未接收）")
+    # 辩论统计。与记忆同理：一个「顺序没检验」的静默辩论，
+    # 在最终信号上与没开辩论毫无区别，那就必须写在报告里。
+    db = ss.get("debate")
+    if isinstance(db, dict):
+        A(f"- 多空辩论：{db.get('debates', 0)} 次辩论、{db.get('turns', 0)} 次发言、"
+          f"{db.get('calls', 0)} 次模型调用")
+        if db.get("order_checked"):
+            A(f"  - 顺序置换检验 {db['order_checked']} 次，判为顺序敏感 "
+              f"{db.get('order_sensitive', 0)} 次")
+        else:
+            A("  > ⚠️ 未做顺序置换检验 —— 「不受发言顺序影响」本次**未经检验**。"
+              "没验证不等于验证通过。")
+        if db.get("judge_failed"):
+            A(f"  > ⚠️ 裁决解析失败 {db.get('judge_failed', 0)} 次，"
+              "已显式降级（未伪造方向）")
     A("")
     if "样本不足" in rep.grade:
         A("> ⚠️ **交易样本不足，下表仅供参考，不构成对策略有效性的判断。**")

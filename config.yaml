@@ -63,6 +63,13 @@ strategy_params:
     oversold: 28
     overbought: 72
     trend_filter: true
+  # 多空辩论（analyze --debate / --strategy debate）
+  # 成本 = 2*max_rounds 次发言 + 1 次裁决（+1 次若开顺序置换检验）
+  # max_rounds=2 → 6 次调用/次决策。轮数再往上加，边际信息很少、成本线性涨。
+  debate:
+    max_rounds: 2
+    order: bull_first      # 谁先发言。先手不该是硬编码，所以它是个写下来的决定
+    order_check: true      # 顺序置换检验：多一次裁决调用，换一个能写进报告的判据
 
 # ---------------- 验证层 ----------------
 validate:

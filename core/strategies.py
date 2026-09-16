@@ -309,6 +309,11 @@ class LLMStrategy(Strategy):
         self.prompt_version = prompt_version
         self.buy_th, self.sell_th = min_score_to_buy, max_score_to_sell
         self.memory = memory
+        # 名字跟着分析器走：分析器报 stats_scope="debate" 时，这个策略就该叫 debate。
+        # 放在这里而不是放在构造它的地方，是因为「策略叫什么」应当取决于它实际在做什么，
+        # 而不是取决于谁把它拼出来的 —— 否则换个入口构造，报告就又写成 llm 了。
+        if getattr(analyzer, "stats_scope", "") == "debate":
+            self.name = "debate"
         # 记忆使用台账：没有它就无法回答"这次回测到底有没有真的注入记忆"
         # —— 一个静默失效的记忆注入，和没注入的区别，只有在对比里才看得出来。
         self.stats = {"memory_injected": 0, "lessons_shown": 0,
