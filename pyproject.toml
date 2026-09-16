@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsa-lite"
+version = "0.1.0"
+description = "带策略验证的 A 股 LLM 分析系统 —— 工程结构参考 daily_stock_analysis，核心增量是可证伪的回测与验证层"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "AandBorC" }]
+keywords = ["a-share", "stock", "llm", "backtest", "quant", "tushare", "ollama"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+# 核心零强制依赖 —— 纯标准库即可跑通 analyze / backtest / validate
+dependencies = []
+
+[project.optional-dependencies]
+# 读取 config.yaml
+yaml = ["pyyaml>=6.0"]
+# 备用数据源（东财接口被限流时顶上）
+sources = ["akshare>=1.12.0", "tushare>=1.4.0", "baostock>=0.8.8"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/AandBorC/dsa-lite"
+Repository = "https://github.com/AandBorC/dsa-lite"
+Issues = "https://github.com/AandBorC/dsa-lite/issues"
+
+[project.scripts]
+dsa-lite = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".git", "__pycache__", ".venv", "venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

@@ -1,0 +1,89 @@
+# ============================================================
+# dsa-lite 配置
+# 改完提示词模板记得改 prompt_version，否则回测结论会和实盘对不上
+# ============================================================
+
+# 自选股（必须先跑 validate 验证策略有效性，再拿来看盘）
+watchlist:
+  - sh600519      # 贵州茅台
+  - sz000858      # 五粮液
+  - sh601318      # 中国平安
+  - sz300750      # 宁德时代
+  - sh600036      # 招商银行
+
+# 回测基准，用于算超额收益。没基准的回测等于没做
+benchmark: sh000300
+
+# 数据源降级顺序。eastmoney/tencent 只用标准库，放前面保证任何环境都能跑
+# 实测：eastmoney 有 IP 级限流，批量抓取会被打回 → tencent 顶上
+fetcher_priority:
+  - eastmoney
+  - tencent
+  - akshare
+  - tushare
+  - baostock
+
+adjust: qfq          # qfq 前复权（回测必须用复权价，否则除权日会出现假暴跌）
+start_date: ""       # 空 = 自动取 days_back 天前
+
+strategy: five_dim   # 默认回测策略
+analyzer: auto       # auto = 能连上就真模型，连不上自动退回规则模拟
+# analyzer 的判定顺序：LLM_BASE_URL / LLM_API_KEY 环境变量 → 本地 Ollama → 规则模拟
+# 本地 Ollama 是零成本真模型路线，实测 qwen2.5:7b 单次约 16s，可直接用
+
+# ---------------- 回测与风控参数 ----------------
+backtest:
+  initial_cash: 100000
+  per_trade_pct: 0.30        # 单笔最大占权益比例（对应风控层仓位铁律）
+  max_positions: 5
+  commission_rate: 0.00025   # 佣金万 2.5
+  commission_min: 5.0
+  stamp_tax_rate: 0.0005     # 印花税（卖出）
+  transfer_rate: 0.00001
+  slippage_pct: 0.001        # 单边滑点 0.1%
+  stop_loss_pct: 0.08
+  take_profit_pct: 0.25
+  trailing_stop_pct: 0.10
+  max_holding_days: 30
+  cooldown_after_losses: 3   # 连亏 3 笔熔断
+  cooldown_days: 5
+  risk_free_rate: 0.02
+
+# ---------------- 策略参数 ----------------
+strategy_params:
+  ma_cross:
+    short: 5
+    long: 20
+    stop_atr: 2.0
+  five_dim:
+    buy_threshold: 66      # 实测 70 太严：20个月只出3笔，样本不足无法验证
+    sell_threshold: 48     # 贴近中性才能触发"评分转弱"换手，否则只能靠止损离场
+    stop_atr: 2.5
+  rsi_reversion:
+    oversold: 28
+    overbought: 72
+    trend_filter: true
+
+# ---------------- 验证层 ----------------
+validate:
+  split: 0.7        # 样本内占比，其余为样本外（过拟合检测）
+  min_trades: 20    # 少于这个交易数，任何结论都不成立
+
+# ---------------- 推送通道（填哪个开哪个） ----------------
+notify:
+  console: true
+  log_file: data/reports.md
+  wecom_webhook: ""            # 企业微信群机器人
+  feishu_webhook: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  discord_webhook: ""
+  slack_webhook: ""
+  email:
+    smtp_host: ""
+    smtp_port: 465
+    use_ssl: true
+    username: ""
+    password: ""
+    sender: ""
+    to: ""                     # 多个用逗号分隔

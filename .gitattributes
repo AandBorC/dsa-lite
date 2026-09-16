@@ -1,0 +1,41 @@
+# 强制 LF —— 这些文件会被 Linux 上的解释器/内核直接消费，
+# CRLF 会导致 shebang 失效或脚本报 "$'\r': command not found"
+*.sh            text eol=lf
+*.bash          text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+Makefile        text eol=lf
+.env            text eol=lf
+.env.example    text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# 源码/文档：入库统一 LF，检出时按平台自动转换。
+# Windows 用户改完文件不会因为整份文件换行符变化而产出巨大 diff。
+*.py            text eol=lf
+*.md            text eol=lf
+*.json          text eol=lf
+*.toml          text eol=lf
+*.cfg           text eol=lf
+*.txt           text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# CSV 台账每天 append，必须保持可读、可 diff（别标 -diff，那会让
+# GitHub 把它当二进制显示，整个文件在网页上就看不了了）
+*.csv           text eol=lf
+
+# 二进制
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.xlsx          binary
+
+# 语言统计：不要把这些算进代码行数
+README.md       linguist-documentation
+docs/**         linguist-documentation
+*.csv           linguist-vendored

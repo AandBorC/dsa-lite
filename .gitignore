@@ -1,0 +1,29 @@
+# 凭证 —— 永远不要提交
+.env
+*.key
+*.pem
+*.p12
+
+# 运行产物
+data/cache/
+data/ledger/llm_cache.json
+data/reports.md
+reports/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 注意：data/ledger/signals.csv 要保留并提交
+# 它是回测的样本来源，丢了就等于把历史判断全丢了
+!data/ledger/signals.csv

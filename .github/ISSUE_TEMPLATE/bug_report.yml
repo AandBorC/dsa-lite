@@ -1,0 +1,64 @@
+name: Bug 反馈
+description: 报告一个可复现的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        报问题前，请先跑一次 **`python main.py doctor`**。
+        它会把数据源、接口权限、LLM 连通性逐项戳一遍，
+        大多数「跑不起来」当场就能定位到是哪一环。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 命令 + 完整报错，不要只贴最后一行
+      placeholder: |
+        $ python main.py analyze
+        ...完整输出...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor 输出
+      description: 粘贴 `python main.py doctor` 的结果（注意先删掉 token 和本机路径）
+      render: markdown
+    validations:
+      required: false
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      placeholder: "3.12.10"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: 数据源
+      options:
+        - 东方财富（默认，零依赖）
+        - 腾讯（零依赖）
+        - tushare
+        - akshare
+        - baostock
+        - 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: llm
+    attributes:
+      label: LLM 路线
+      options:
+        - 未配（走离线规则模拟器）
+        - 本地 Ollama
+        - DeepSeek / 云端 API
+        - 不确定
+    validations:
+      required: false
