@@ -173,10 +173,11 @@ dsa-lite/
 │   ├── test_adjust.py       复权算法验收（10 项断言，用真实除权事件判定）
 │   ├── test_lookahead.py    时点门控验收（27 项断言，含对照组）
 │   ├── test_memory.py       反思记忆验收（116 项断言，重点证明它不漏未来）
-│   └── test_debate.py       多空辩论验收（132 项断言，重点证明它不会失控）
+│   ├── test_debate.py       多空辩论验收（132 项断言，重点证明它不会失控）
+│   └── test_workflows.py    workflow 静态守卫（26 项断言，证明 CI 自己真的在跑）
 ├── docs/DEPLOY.md           部署指南（Actions / cron / systemd / LLM 配置）
 ├── .github/workflows/
-│   ├── ci.yml               测试 + 零依赖守卫 + 网络冒烟
+│   ├── ci.yml               测试 + 零依赖守卫 + workflow 静态守卫 + 网络冒烟
 │   └── daily.yml            每交易日 18:00 自动分析并提交台账
 ├── pyproject.toml           打包元数据（零强制依赖）
 ├── reports/                 体检报告输出
@@ -660,7 +661,20 @@ qfq(t) = raw(t) × adj_factor(t) / adj_factor(最新日)
 以及不阻塞的「网络冒烟」（数据源被限流是常态，不该因此把 CI 判红）
 和静态检查（风格问题不该拦住功能合并）。
 
-五套测试都在 CI 里跑，共 338 项断言：
+**`tests/test_workflows.py`：让 CI 自己也被测试。** 这条守卫来自一次真实事故 ——
+为了把记忆库/辩论库导到临时目录，曾经把 `${{ runner.temp }}` 写进了
+**job 级** `env:`。语法完全合法、缩进无懈可击、本地把 YAML 解析一遍也全过，
+但 `runner` 上下文在 `jobs.<id>.env` 里**不可用**：GitHub 直接判「workflow 无效」，
+整条流水线**零 job**、立刻变红，而且 **run 日志里一个字都没有**。
+
+这比"测试失败"危险得多 —— 它不告诉你哪里错了，还可能给你假绿灯。
+现在这条守卫在本地就能拦下它，并且**每条判据都带对照组**（证明它真的会抓、
+且不会把 step 级 `env:` 里的 `runner.*` 误报）。顺带守住另外四件事：
+表达式根名合法、每个 job 有 `runs-on`/`steps`、`uses` 都钉了版本、
+以及**`tests/` 下每个测试文件都真的被 ci.yml 执行**（加了测试忘了挂 CI，
+等于没加）。
+
+六套测试都在 CI 里跑，共 364 项断言：
 
 | 测试 | 断言 | 在验什么 |
 |------|------|---------|
@@ -669,8 +683,9 @@ qfq(t) = raw(t) × adj_factor(t) / adj_factor(最新日)
 | `tests/test_lookahead.py` | 27 | 时点门控有没有真的挡住未来数据（含对照组） |
 | `tests/test_memory.py` | 116 | 反思记忆会不会漏未来（含对照组，重点在"不该看见时看不见"） |
 | `tests/test_debate.py` | 132 | 多空辩论会不会失控（含对照组，重点在"顺序检验真会报警吗"） |
+| `tests/test_workflows.py` | 26 | CI 自己有没有真的在跑（含对照组，重点在"零 job 静默失败"） |
 
-五个都是纯标准库、纯离线，所以在 `stdlib-only` 里也能跑。
+六个都是纯标准库、纯离线，所以在 `stdlib-only` 里也能跑。
 
 `stdlib-only` 里还有一步**反向检查**：跑完之后断言 `data/memory/` 与
 `data/debate/` 都不存在、`data/ledger/signals.csv` 没被改动。
@@ -732,6 +747,12 @@ qfq(t) = raw(t) × adj_factor(t) / adj_factor(最新日)
 - **辩论成本随轮数线性增长，信息增量不线性**：`rounds=2` 已经 6 次调用，
   `rounds=4` 就是 10 次。默认值是 2，往上加之前建议先用
   `compare --strategies llm,debate` 确认它真的值这个价
+- **workflow 静态守卫是文本级检查，不是 GitHub 的解析器**：它能挡住
+  「job 级 `env` 用了 `runner.*`」这类**上下文可用性**错误（就是真出过的那次），
+  但 GitHub 的 schema 远比它严格。**最终判据只有一个**：
+  `gh workflow run <file>` —— 文件无效时它以 HTTP 422 原文返回具体行列，
+  这是本地唯一能拿到真实报错的通道（run 页面里**什么都没有**，
+  因为零 job 的失败根本没机会产生日志）
 - **复权基准日的时点只修正了绝对价位**：日收益率序列本来就不受影响。
   想彻底避开基准漂移，回测可以直接用后复权（`adjust: hfq`）——
   它的基准固定在最早一日，不随时间移动

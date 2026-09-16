@@ -25,14 +25,21 @@ jobs:
     name: 零依赖（不装任何第三方包）
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      # 记忆库必须导到临时目录：测试里分析的每一步都会写判断记录，
-      # 落在仓库里就成了"假记忆"，而假记忆会被真的注入后续分析。
-      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
-      # 辩论过程同理：跑一次回测就往仓库里灌几百条记录，没人愿意 review
-      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     steps:
       - uses: actions/checkout@v4
+
+      # ⚠️ 运行期目录绝不能写进 job 级 env：
+      #    runner 上下文在 jobs.<id>.env 里不可用，GitHub 会判「workflow 无效」，
+      #    整条流水线零 job 直接红，日志里什么线索都没有。
+      #    正确做法是写进 $GITHUB_ENV（RUNNER_TEMP 是默认环境变量，run 步骤里一定能拿到）。
+      # 为什么要导到临时目录：
+      #  · 记忆库——测试里分析的每一步都会写判断记录，落在仓库里就成了"假记忆"，
+      #    而假记忆会被真的注入后续分析；
+      #  · 辩论库——跑一次回测就往仓库里灌几百条记录，没人愿意 review。
+      - name: 隔离运行目录（防「假记忆 / 假辩论」注入）
+        run: |
+          echo "DSA_MEMORY_DIR=$RUNNER_TEMP/dsa-memory" >> "$GITHUB_ENV"
+          echo "DSA_DEBATE_DIR=$RUNNER_TEMP/dsa-debate" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -46,6 +53,9 @@ jobs:
               assert u.find_spec(mod) is None, f"{mod} 不该存在，零依赖测试已失效"
           print("环境干净：无任何第三方依赖 ✅")
           PY
+
+      - name: workflow 静态守卫（防"整条 CI 被静默判无效"）
+        run: python tests/test_workflows.py
 
       - name: 自检（验证「验证器」本身是否可信）
         run: python tests/selftest.py
@@ -96,15 +106,18 @@ jobs:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
-      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+
+      # 见 stdlib-only 里的说明：必须走 $GITHUB_ENV，不能写 job 级 env
+      - name: 隔离运行目录
+        run: |
+          echo "DSA_MEMORY_DIR=$RUNNER_TEMP/dsa-memory" >> "$GITHUB_ENV"
+          echo "DSA_DEBATE_DIR=$RUNNER_TEMP/dsa-debate" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -114,6 +127,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyyaml
+
+      - name: workflow 静态守卫
+        run: python tests/test_workflows.py
 
       - name: 自检
         run: python tests/selftest.py
@@ -152,11 +168,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
-    env:
-      DSA_MEMORY_DIR: ${{ runner.temp }}/dsa-memory
-      DSA_DEBATE_DIR: ${{ runner.temp }}/dsa-debate
     steps:
       - uses: actions/checkout@v4
+
+      # 见 stdlib-only 里的说明：必须走 $GITHUB_ENV，不能写 job 级 env
+      - name: 隔离运行目录
+        run: |
+          echo "DSA_MEMORY_DIR=$RUNNER_TEMP/dsa-memory" >> "$GITHUB_ENV"
+          echo "DSA_DEBATE_DIR=$RUNNER_TEMP/dsa-debate" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
